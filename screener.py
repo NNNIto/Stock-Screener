@@ -602,6 +602,73 @@ def screen_F2(df: pd.DataFrame, info: dict) -> bool:
         return False
 
 # ─────────────────────────────────────────
+# TXTレポート出力
+# ─────────────────────────────────────────
+def _write_txt_report(df_results, df_summary, all_matches, stock_data, path, today):
+    lines = []
+    sep  = "=" * 70
+    sep2 = "-" * 70
+
+    lines.append(sep)
+    lines.append(f"  中期投資スクリーニング レポート  {today}")
+    lines.append(sep)
+    lines.append(f"スキャン銘柄数 : {len(stock_data)}")
+    lines.append(f"ヒット銘柄数   : {len(df_results)}")
+    lines.append("")
+
+    # ── 戦略別サマリー ──
+    lines.append("【戦略別ヒット数サマリー】")
+    lines.append(sep2)
+    for _, row in df_summary.iterrows():
+        hit = int(row["ヒット銘柄数"])
+        bar = "■" * hit + "□" * max(0, 15 - hit)
+        lines.append(f"  {row['戦略']:<30s}  {hit:>2}件  {bar}")
+        if hit > 0:
+            lines.append(f"    銘柄: {row['銘柄一覧']}")
+    lines.append("")
+
+    # ── 全ヒット銘柄詳細 ──
+    lines.append("【全ヒット銘柄 詳細】")
+    lines.append(sep2)
+    has_fund = "PER" in df_results.columns
+
+    for _, row in df_results.iterrows():
+        lines.append(f"  ▶ {row['銘柄コード']}  現在値:{row['現在値']:>8.0f}円  "
+                     f"RSI:{row['RSI14'] if row['RSI14'] != '' else 'N/A':>5}  "
+                     f"マッチ数:{int(row['マッチ戦略数'])}")
+        if has_fund:
+            per = row.get('PER', '')
+            pbr = row.get('PBR', '')
+            roe = row.get('ROE(%)', '')
+            div = row.get('配当利回り(%)', '')
+            cap = row.get('時価総額(億円)', '')
+            lines.append(f"     PER:{per:<8} PBR:{pbr:<8} ROE:{roe}%  "
+                         f"配当:{div}%  時価総額:{cap}億円")
+        # 戦略を1行ずつ
+        for strat in row["マッチ戦略"].split(" | "):
+            lines.append(f"       ✓ {strat}")
+        lines.append("")
+
+    # ── 複数マッチ銘柄（注目） ──
+    multi = df_results[df_results["マッチ戦略数"] >= 2]
+    if not multi.empty:
+        lines.append("【注目銘柄（2戦略以上マッチ）】")
+        lines.append(sep2)
+        for _, row in multi.iterrows():
+            lines.append(f"  {row['銘柄コード']}  {row['現在値']:>8.0f}円  "
+                         f"({int(row['マッチ戦略数'])}戦略)  {row['マッチ戦略']}")
+        lines.append("")
+
+    lines.append(sep)
+    lines.append(f"  生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"  参照: screening_thresholds.txt (A-1〜F-2 全21戦略)")
+    lines.append(sep)
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+# ─────────────────────────────────────────
 # メイン実行
 # ─────────────────────────────────────────
 STRATEGIES = {
@@ -730,6 +797,11 @@ def run_all_screens():
     out_summary = os.path.join(OUTPUT_DIR, f"screening_summary_{TODAY}.csv")
     df_summary.to_csv(out_summary, index=False, encoding="utf-8-sig")
     print(f"[保存] サマリー:   {out_summary}")
+
+    # ─── TXT出力 ───
+    out_txt = os.path.join(OUTPUT_DIR, f"screening_report_{TODAY}.txt")
+    _write_txt_report(df_results, df_summary, all_matches, stock_data, out_txt, TODAY)
+    print(f"[保存] レポート:   {out_txt}")
 
     # ─── コンソール表示 ───
     print(f"\n{'='*60}")
