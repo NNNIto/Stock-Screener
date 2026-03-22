@@ -602,6 +602,176 @@ def screen_F2(df: pd.DataFrame, info: dict) -> bool:
         return False
 
 # ─────────────────────────────────────────
+# 【I】実践パターン組み合わせ系
+# ─────────────────────────────────────────
+def screen_I1(df: pd.DataFrame, info: dict) -> bool:
+    """I-1: 安定（バランス型）"""
+    try:
+        r = get_latest(df)
+        roe = info.get("returnOnEquity", 0) or 0
+        rev_grw = info.get("revenueGrowth", 0) or 0
+        if roe < 0.10: return False
+        if rev_grw < 0.04: return False
+        if pd.isna(r.SMA75) or r.Close <= r.SMA75: return False
+        if pd.isna(r.RSI14) or not (45 <= r.RSI14 <= 65): return False
+        return True
+    except Exception:
+        return False
+
+def screen_I2(df: pd.DataFrame, info: dict) -> bool:
+    """I-2: 成長型（中期で伸ばす）"""
+    try:
+        r = get_latest(df)
+        rev_grw = info.get("revenueGrowth", 0) or 0
+        roe = info.get("returnOnEquity", 0) or 0
+        margin = info.get("operatingMargins", 0) or 0
+        if rev_grw < 0.15: return False
+        if roe < 0.12: return False
+        if margin < 0.08: return False
+        if pd.isna(r.SMA75) or r.Close <= r.SMA75: return False
+        if pd.isna(r.RET_60D) or r.RET_60D < 10: return False
+        if pd.isna(r.RSI14) or not (45 <= r.RSI14 <= 70): return False
+        return True
+    except Exception:
+        return False
+
+def screen_I3(df: pd.DataFrame, info: dict) -> bool:
+    """I-3: 業績修正（リバウンド狙い）"""
+    try:
+        r = get_latest(df)
+        prev = get_prev(df)
+        pbr = info.get("priceToBook")
+        if pbr is None or pbr > 1.5: return False
+        if pd.isna(r.SMA75) or r.Close <= r.SMA75: return False
+        # MACD買いシグナル（10日以内）または52週高値ブレイク
+        macd_cross = False
+        for i in range(min(10, len(df)-2)):
+            r0 = df.iloc[-(i+1)]
+            r1 = df.iloc[-(i+2)]
+            if pd.isna(r0.MACD) or pd.isna(r0.MACD_sig): continue
+            if r0.MACD > r0.MACD_sig and r1.MACD <= r1.MACD_sig:
+                macd_cross = True; break
+        breakout = not pd.isna(r.HIGH_52W) and r.Close >= r.HIGH_52W
+        if not (macd_cross or breakout): return False
+        return True
+    except Exception:
+        return False
+
+def screen_I4(df: pd.DataFrame, info: dict) -> bool:
+    """I-4: イベントドリブン（短中期）"""
+    try:
+        r = get_latest(df)
+        if pd.isna(r.VOL_MA20) or r.Volume < r.VOL_MA20 * 1.5: return False
+        if pd.isna(r.SMA25) or r.Close <= r.SMA25: return False
+        if pd.isna(r.RSI14) or not (45 <= r.RSI14 <= 70): return False
+        rev_grw = info.get("revenueGrowth", 0) or 0
+        if rev_grw < 0.0: return False
+        return True
+    except Exception:
+        return False
+
+def screen_I5(df: pd.DataFrame, info: dict) -> bool:
+    """I-5: 安定重視（ドローダウン抑制）"""
+    try:
+        r = get_latest(df)
+        roe = info.get("returnOnEquity", 0) or 0
+        if roe < 0.12: return False
+        if pd.isna(r.SMA200) or r.Close <= r.SMA200: return False
+        if pd.isna(r.RSI14) or not (40 <= r.RSI14 <= 65): return False
+        returns = df["Close"].pct_change().iloc[-120:]
+        vol = returns.std()
+        if pd.isna(vol) or vol > 0.022: return False
+        return True
+    except Exception:
+        return False
+
+def screen_I6(df: pd.DataFrame, info: dict) -> bool:
+    """I-6: 高精度（実戦強化・多軸確認）"""
+    try:
+        r = get_latest(df)
+        roe = info.get("returnOnEquity", 0) or 0
+        rev_grw = info.get("revenueGrowth", 0) or 0
+        if roe < 0.12: return False
+        if rev_grw < 0.08: return False
+        if pd.isna(r.SMA200) or r.Close <= r.SMA200: return False
+        if pd.isna(r.RSI14) or not (45 <= r.RSI14 <= 65): return False
+        if pd.isna(r.ADX) or r.ADX < 20: return False
+        if pd.isna(r.DEV_SMA200) or r.DEV_SMA200 > 15: return False
+        return True
+    except Exception:
+        return False
+
+def screen_I7(df: pd.DataFrame, info: dict) -> bool:
+    """I-7: 完全スクリーニング（機関投資家型）"""
+    try:
+        r = get_latest(df)
+        roe = info.get("returnOnEquity", 0) or 0
+        rev_grw = info.get("revenueGrowth", 0) or 0
+        div_yield = info.get("dividendYield", 0) or 0
+        if roe < 0.15: return False
+        if rev_grw < 0.10: return False
+        if pd.isna(r.SMA200) or r.Close <= r.SMA200: return False
+        if pd.isna(r.RSI14) or not (50 <= r.RSI14 <= 65): return False
+        if pd.isna(r.ADX) or r.ADX < 25: return False
+        returns = df["Close"].pct_change().iloc[-120:]
+        vol = returns.std()
+        if pd.isna(vol) or vol > 0.025: return False
+        return True
+    except Exception:
+        return False
+
+def screen_I8(df: pd.DataFrame) -> bool:
+    """I-8: モメンタム特化"""
+    try:
+        r = get_latest(df)
+        if pd.isna(r.RET_60D) or r.RET_60D < 15: return False
+        if pd.isna(r.ADX) or r.ADX < 25: return False
+        if pd.isna(r.DI_pos) or pd.isna(r.DI_neg) or r.DI_pos <= r.DI_neg: return False
+        if pd.isna(r.SMA200) or r.Close <= r.SMA200: return False
+        if pd.isna(r.RET_20D) or r.RET_20D < 5: return False
+        return True
+    except Exception:
+        return False
+
+def screen_I9(df: pd.DataFrame, info: dict) -> bool:
+    """I-9: 小型成長株"""
+    try:
+        r = get_latest(df)
+        rev_grw = info.get("revenueGrowth", 0) or 0
+        roe = info.get("returnOnEquity", 0) or 0
+        margin = info.get("operatingMargins", 0) or 0
+        mktcap = info.get("marketCap", 0) or 0
+        if rev_grw < 0.20: return False
+        if roe < 0.10: return False
+        if margin < 0.05: return False
+        # 時価総額30億〜500億円
+        if mktcap > 0 and not (3e9 <= mktcap <= 50e9): return False
+        if pd.isna(r.SMA75) or r.Close <= r.SMA75: return False
+        if pd.isna(r.RSI14) or not (45 <= r.RSI14 <= 70): return False
+        if pd.isna(r.RET_60D) or r.RET_60D < 5: return False
+        return True
+    except Exception:
+        return False
+
+def screen_I10(df: pd.DataFrame, info: dict) -> bool:
+    """I-10: ディフェンシブ"""
+    try:
+        r = get_latest(df)
+        roe = info.get("returnOnEquity", 0) or 0
+        div_yield = info.get("dividendYield", 0) or 0
+        payout = info.get("payoutRatio", 0) or 0
+        if roe < 0.08: return False
+        if div_yield < 0.025: return False
+        if not (0.20 <= payout <= 0.60): return False
+        if pd.isna(r.SMA75) or r.Close <= r.SMA75: return False
+        returns = df["Close"].pct_change().iloc[-120:]
+        vol = returns.std()
+        if pd.isna(vol) or vol > 0.020: return False
+        return True
+    except Exception:
+        return False
+
+# ─────────────────────────────────────────
 # TXTレポート出力
 # ─────────────────────────────────────────
 def _write_txt_report(df_results, df_summary, all_matches, stock_data, path, today):
@@ -661,7 +831,7 @@ def _write_txt_report(df_results, df_summary, all_matches, stock_data, path, tod
 
     lines.append(sep)
     lines.append(f"  生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append(f"  参照: screening_thresholds.txt (A-1〜F-2 全21戦略)")
+    lines.append(f"  参照: screening_thresholds.txt (A-1〜F-2 全21戦略 + I-1〜I-10 全10戦略)")
     lines.append(sep)
 
     with open(path, "w", encoding="utf-8") as f:
@@ -693,6 +863,16 @@ STRATEGIES = {
     "E-4_空売り低下":              lambda df, info: screen_E4(df),
     "F-1_高品質コア":              lambda df, info: screen_F1(df, info),
     "F-2_低ボラ安定配当":           lambda df, info: screen_F2(df, info),
+    "I-1_安定バランス":            lambda df, info: screen_I1(df, info),
+    "I-2_成長型":                  lambda df, info: screen_I2(df, info),
+    "I-3_業績修正リバウンド":        lambda df, info: screen_I3(df, info),
+    "I-4_イベントドリブン":          lambda df, info: screen_I4(df, info),
+    "I-5_安定重視ドローダウン抑制":   lambda df, info: screen_I5(df, info),
+    "I-6_高精度多軸":              lambda df, info: screen_I6(df, info),
+    "I-7_完全機関投資家型":          lambda df, info: screen_I7(df, info),
+    "I-8_モメンタム特化":            lambda df, info: screen_I8(df),
+    "I-9_小型成長株":              lambda df, info: screen_I9(df, info),
+    "I-10_ディフェンシブ":           lambda df, info: screen_I10(df, info),
 }
 
 def run_all_screens():
@@ -723,7 +903,7 @@ def run_all_screens():
         matched = []
         for strategy_name, func in STRATEGIES.items():
             # info が必要な戦略の場合のみ取得
-            needs_info = any(x in strategy_name for x in ["PBR","PER","配当","成長","CANSLIM","自社株","上方修正","品質","ボラ"])
+            needs_info = any(x in strategy_name for x in ["PBR","PER","配当","成長","CANSLIM","自社株","上方修正","品質","ボラ","安定","イベント","修正","ドロー","精度","機関","小型","ディフェン"])
             if needs_info and ticker not in info_cache:
                 try:
                     info_cache[ticker] = fetch_info(ticker)
