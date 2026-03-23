@@ -1,5 +1,5 @@
 """
-中期投資スクリーニング 全21戦略 実行スクリプト
+中期投資スクリーニング 全31戦略 実行スクリプト（グローバル・グロース重視版）
 参照: screening_thresholds.txt / screening_combinations.txt
 """
 
@@ -25,32 +25,37 @@ TODAY = datetime.today().strftime("%Y-%m-%d")
 PERIOD_LONG  = "2y"   # 200日MA用
 PERIOD_SHORT = "6mo"  # 短期指標用
 
-# 東証プライム主要銘柄リスト（流動性の高い代表銘柄）
+# グローバル銘柄ユニバース（グロース株重視・全世界対象）
 STOCK_UNIVERSE = [
-    # 指数構成・大型株
-    "7203.T","6758.T","8306.T","9432.T","6861.T","4063.T","8035.T","9984.T",
-    "6954.T","7974.T","4502.T","8316.T","7267.T","6902.T","9433.T","4519.T",
-    "6501.T","7751.T","8411.T","4661.T","6702.T","8058.T","2914.T","9022.T",
-    "7741.T","6367.T","3382.T","8031.T","6503.T","4543.T","6326.T","8001.T",
-    "4568.T","7269.T","6724.T","8766.T","9020.T","7733.T","6971.T","4578.T",
-    "8802.T","6645.T","5108.T","7201.T","4911.T","2802.T","6762.T","6301.T",
-    "8309.T","7符.T","6988.T","4704.T","4523.T","6857.T","8830.T","9437.T",
-    "4751.T","3659.T","6594.T","7716.T","4755.T","3産.T","6460.T","2413.T",
-    # 中型株・成長株
-    "6920.T","4385.T","4689.T","3697.T","4478.T","4433.T","3923.T","4980.T",
-    "6098.T","4448.T","7072.T","4371.T","3769.T","6095.T","4484.T","4565.T",
-    "4395.T","6532.T","4194.T","4376.T","3950.T","9166.T","4193.T","4397.T",
-    "6522.T","4199.T","3987.T","4892.T","9270.T","7748.T","6268.T","4387.T",
-    "2150.T","3064.T","9843.T","3197.T","2651.T","3405.T","5401.T","5411.T",
-    "5713.T","5714.T","3086.T","8267.T","3099.T","7513.T","9983.T","2678.T",
-    "3048.T","2782.T","3141.T","7453.T","9831.T","8905.T","8136.T","3092.T",
-    "9601.T","4307.T","6976.T","4704.T","3436.T","5332.T","4901.T","6971.T",
+    # ── 米国 メガキャップ・テック ──
+    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "TSM",
+    # ── 米国 グロース・ソフトウェア ──
+    "CRM", "ADBE", "NOW", "SNOW", "DDOG", "ZS", "CRWD", "NET", "OKTA", "MDB",
+    "PLTR", "AI", "SMCI", "ARM", "ANET", "FTNT", "PANW", "GTLB", "BILL",
+    "HUBS", "RBLX", "U", "ABNB", "UBER",
+    # ── 米国 半導体 ──
+    "AMD", "INTC", "QCOM", "MU", "MRVL", "KLAC", "LRCX", "AMAT",
+    "NXPI", "ON", "MPWR",
+    # ── 米国 Eコマース・フィンテック ──
+    "SHOP", "MELI", "SE", "COIN", "XYZ", "PYPL", "AFRM", "SOFI",
+    # ── 米国 ヘルスケア・バイオ ──
+    "LLY", "NVO", "MRNA", "REGN", "VRTX", "DXCM", "ISRG", "IDXX", "VEEV",
+    # ── 米国 消費・その他グロース ──
+    "COST", "DECK", "LULU", "CELH", "MNST", "AXON", "CAVA", "DUOL",
+    # ── 米国 大型バリュー（比較対象） ──
+    "V", "MA", "JPM", "JNJ", "PG", "HD", "WMT", "BRK-B",
+    # ── 欧州（米国上場 / ADR） ──
+    "ASML", "SAP", "BKNG", "SIEGY",
+    # ── 中国 ADR ──
+    "BABA", "PDD", "JD", "BIDU", "NIO", "LI", "XPEV", "TCOM",
+    # ── インド ──
+    "INFY", "WIT", "HDB", "IBN",
+    # ── 日本（グロース・優良株） ──
+    "7203.T", "6758.T", "9984.T", "6861.T", "4063.T", "8035.T",
+    "6920.T", "4385.T", "4484.T", "6857.T", "4751.T", "9270.T",
+    "4478.T", "3659.T", "6594.T", "4689.T", "6098.T", "4307.T",
+    "8766.T", "8058.T", "4543.T", "2802.T", "7741.T", "7716.T",
 ]
-
-# 無効なティッカーを除去
-STOCK_UNIVERSE = [t for t in STOCK_UNIVERSE if t.replace(".T","").isdigit() or len(t) <= 8]
-# 数字4桁.T のみ残す
-STOCK_UNIVERSE = [t for t in STOCK_UNIVERSE if len(t.replace(".T","")) == 4 and t.replace(".T","").isdigit()]
 
 # 重複除去
 STOCK_UNIVERSE = list(dict.fromkeys(STOCK_UNIVERSE))
@@ -625,12 +630,12 @@ def screen_I2(df: pd.DataFrame, info: dict) -> bool:
         rev_grw = info.get("revenueGrowth", 0) or 0
         roe = info.get("returnOnEquity", 0) or 0
         margin = info.get("operatingMargins", 0) or 0
-        if rev_grw < 0.15: return False
-        if roe < 0.12: return False
-        if margin < 0.08: return False
+        if rev_grw < 0.12: return False   # グロース重視：15%→12%に緩和
+        if roe < 0.10: return False         # グロース重視：12%→10%に緩和
+        if margin < 0.05: return False      # グロース重視：8%→5%に緩和（赤字転換期グロースも対象）
         if pd.isna(r.SMA75) or r.Close <= r.SMA75: return False
-        if pd.isna(r.RET_60D) or r.RET_60D < 10: return False
-        if pd.isna(r.RSI14) or not (45 <= r.RSI14 <= 70): return False
+        if pd.isna(r.RET_60D) or r.RET_60D < 8: return False
+        if pd.isna(r.RSI14) or not (45 <= r.RSI14 <= 75): return False  # RSI上限も緩和
         return True
     except Exception:
         return False
@@ -744,8 +749,8 @@ def screen_I9(df: pd.DataFrame, info: dict) -> bool:
         if rev_grw < 0.20: return False
         if roe < 0.10: return False
         if margin < 0.05: return False
-        # 時価総額30億〜500億円
-        if mktcap > 0 and not (3e9 <= mktcap <= 50e9): return False
+        # 時価総額200M〜10B USD（グローバル小型〜中型成長株）
+        if mktcap > 0 and not (2e8 <= mktcap <= 10e9): return False
         if pd.isna(r.SMA75) or r.Close <= r.SMA75: return False
         if pd.isna(r.RSI14) or not (45 <= r.RSI14 <= 70): return False
         if pd.isna(r.RET_60D) or r.RET_60D < 5: return False
@@ -780,7 +785,7 @@ def _write_txt_report(df_results, df_summary, all_matches, stock_data, path, tod
     sep2 = "-" * 70
 
     lines.append(sep)
-    lines.append(f"  中期投資スクリーニング レポート  {today}")
+    lines.append(f"  中期投資スクリーニング レポート（グローバル・グロース重視）  {today}")
     lines.append(sep)
     lines.append(f"スキャン銘柄数 : {len(stock_data)}")
     lines.append(f"ヒット銘柄数   : {len(df_results)}")
@@ -803,7 +808,8 @@ def _write_txt_report(df_results, df_summary, all_matches, stock_data, path, tod
     has_fund = "PER" in df_results.columns
 
     for _, row in df_results.iterrows():
-        lines.append(f"  ▶ {row['銘柄コード']}  現在値:{row['現在値']:>8.0f}円  "
+        ticker_disp = row['ティッカー'] if 'ティッカー' in row.index else row['銘柄コード']
+        lines.append(f"  ▶ {ticker_disp:<8}  現在値:{row['現在値']:>10.2f}  "
                      f"RSI:{row['RSI14'] if row['RSI14'] != '' else 'N/A':>5}  "
                      f"マッチ数:{int(row['マッチ戦略数'])}")
         if has_fund:
@@ -811,9 +817,10 @@ def _write_txt_report(df_results, df_summary, all_matches, stock_data, path, tod
             pbr = row.get('PBR', '')
             roe = row.get('ROE(%)', '')
             div = row.get('配当利回り(%)', '')
-            cap = row.get('時価総額(億円)', '')
+            cap = row.get('時価総額(B$)', '')
+            grw = row.get('売上高成長(%)', '')
             lines.append(f"     PER:{per:<8} PBR:{pbr:<8} ROE:{roe}%  "
-                         f"配当:{div}%  時価総額:{cap}億円")
+                         f"売上成長:{grw}%  配当:{div}%  時価総額:{cap}B$")
         # 戦略を1行ずつ
         for strat in row["マッチ戦略"].split(" | "):
             lines.append(f"       ✓ {strat}")
@@ -936,11 +943,12 @@ def run_all_screens():
             # ファンダ情報を追加
             if ticker in info_cache and info_cache[ticker]:
                 info = info_cache[ticker]
-                row["PER"]      = round(info.get("trailingPE") or 0, 1) or ""
-                row["PBR"]      = round(info.get("priceToBook") or 0, 2) or ""
-                row["ROE(%)"]   = round((info.get("returnOnEquity") or 0) * 100, 1) or ""
+                row["PER"]        = round(info.get("trailingPE") or 0, 1) or ""
+                row["PBR"]        = round(info.get("priceToBook") or 0, 2) or ""
+                row["ROE(%)"]     = round((info.get("returnOnEquity") or 0) * 100, 1) or ""
                 row["配当利回り(%)"] = round((info.get("dividendYield") or 0) * 100, 2) or ""
-                row["時価総額(億円)"] = round((info.get("marketCap") or 0) / 1e8, 0) or ""
+                row["売上高成長(%)"] = round((info.get("revenueGrowth") or 0) * 100, 1) or ""
+                row["時価総額(B$)"]  = round((info.get("marketCap") or 0) / 1e9, 2) or ""
             results.append(row)
 
     # DataFrameに変換
