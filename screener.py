@@ -19,7 +19,8 @@ from datetime import datetime, timedelta
 # 設定
 # ─────────────────────────────────────────
 TODAY = datetime.today().strftime("%Y-%m-%d")
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "results", TODAY)
+RUN_DATETIME = datetime.today().strftime("%Y-%m-%d_%H%M")
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "results", RUN_DATETIME)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 PERIOD_LONG  = "2y"   # 200日MA用
 PERIOD_SHORT = "6mo"  # 短期指標用
