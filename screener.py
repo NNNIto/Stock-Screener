@@ -18,10 +18,9 @@ from datetime import datetime, timedelta
 # ─────────────────────────────────────────
 # 設定
 # ─────────────────────────────────────────
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "results")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
 TODAY = datetime.today().strftime("%Y-%m-%d")
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "results", TODAY)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 PERIOD_LONG  = "2y"   # 200日MA用
 PERIOD_SHORT = "6mo"  # 短期指標用
 
@@ -960,7 +959,7 @@ def run_all_screens():
     df_results = df_results.sort_values("マッチ戦略数", ascending=False)
 
     # ─── CSV出力: 全銘柄統合 ───
-    out_all = os.path.join(OUTPUT_DIR, f"screening_all_{TODAY}.csv")
+    out_all = os.path.join(OUTPUT_DIR, "screening_all.csv")
     df_results.to_csv(out_all, index=False, encoding="utf-8-sig")
     print(f"\n[保存] 全銘柄統合: {out_all}")
 
@@ -974,7 +973,7 @@ def run_all_screens():
 
     if strategy_summary:
         df_by_strategy = pd.concat(strategy_summary, ignore_index=True)
-        out_strat = os.path.join(OUTPUT_DIR, f"screening_by_strategy_{TODAY}.csv")
+        out_strat = os.path.join(OUTPUT_DIR, "screening_by_strategy.csv")
         df_by_strategy.to_csv(out_strat, index=False, encoding="utf-8-sig")
         print(f"[保存] 戦略別:    {out_strat}")
 
@@ -982,12 +981,12 @@ def run_all_screens():
     summary_rows = [{"戦略": k, "ヒット銘柄数": len(v), "銘柄一覧": ",".join(v)}
                     for k, v in all_matches.items()]
     df_summary = pd.DataFrame(summary_rows)
-    out_summary = os.path.join(OUTPUT_DIR, f"screening_summary_{TODAY}.csv")
+    out_summary = os.path.join(OUTPUT_DIR, "screening_summary.csv")
     df_summary.to_csv(out_summary, index=False, encoding="utf-8-sig")
     print(f"[保存] サマリー:   {out_summary}")
 
     # ─── TXT出力 ───
-    out_txt = os.path.join(OUTPUT_DIR, f"screening_report_{TODAY}.txt")
+    out_txt = os.path.join(OUTPUT_DIR, "screening_report.txt")
     _write_txt_report(df_results, df_summary, all_matches, stock_data, out_txt, TODAY)
     print(f"[保存] レポート:   {out_txt}")
 
