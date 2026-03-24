@@ -799,6 +799,163 @@ def save_results(results: list):
     print("\n【米国株 ヒット銘柄】")
     print(df_all[df_all["市場"]=="US"][cols].to_string(index=False) if len(us_hits) else "  なし")
 
+# ─────────────────────────────────────────
+# 注目銘柄 詳細分析
+# ─────────────────────────────────────────
+def generate_stock_analysis(ticker: str, info: dict, market: str) -> str:
+    """個別銘柄の四季報的情報 + 5年株価分析 + ニュース"""
+    lines = []
+
+    name     = info.get("longName") or info.get("shortName") or ticker
+    sector   = info.get("sector") or "N/A"
+    industry = info.get("industry") or "N/A"
+    country  = info.get("country") or ""
+    emp      = info.get("fullTimeEmployees")
+    website  = info.get("website") or ""
+
+    lines.append(f"\n{'━'*68}")
+    lines.append(f"■ {ticker}  {name}")
+    lines.append(f"  市場: {market} | セクター: {sector} | 業種: {industry}")
+    if country: lines.append(f"  国: {country}" + (f" | Web: {website}" if website else ""))
+    if emp:     lines.append(f"  従業員数: {emp:,}人")
+    lines.append(f"{'━'*68}")
+
+    # ── 事業概要 ──
+    desc = (info.get("longBusinessSummary") or "")[:500]
+    if desc:
+        lines.append("\n[事業概要]")
+        lines.append(f"  {desc}" + ("..." if len(info.get('longBusinessSummary','')) > 500 else ""))
+
+    # ── 財務指標 ──
+    mktcap  = info.get("marketCap") or 0
+    per     = info.get("trailingPE")
+    pbr     = info.get("priceToBook")
+    roe     = (info.get("returnOnEquity")    or 0) * 100
+    roa     = (info.get("returnOnAssets")    or 0) * 100
+    rev_grw = (info.get("revenueGrowth")     or 0) * 100
+    gross   = (info.get("grossMargins")      or 0) * 100
+    op_mg   = (info.get("operatingMargins")  or 0) * 100
+    div_y   = (info.get("dividendYield")     or 0) * 100
+    payout  = (info.get("payoutRatio")       or 0) * 100
+    de      = info.get("debtToEquity")
+
+    mktcap_str = (f"{mktcap/1e8:.0f}億円" if market == "JP" else f"${mktcap/1e9:.1f}B") if mktcap else "N/A"
+
+    lines.append("\n[財務指標]")
+    lines.append(f"  時価総額:     {mktcap_str}")
+    lines.append(f"  PER:          {per:.1f}倍" if per else "  PER:          N/A")
+    lines.append(f"  PBR:          {pbr:.2f}倍" if pbr else "  PBR:          N/A")
+    lines.append(f"  ROE:          {roe:.1f}%    ROA: {roa:.1f}%")
+    lines.append(f"  売上成長率:   {rev_grw:.1f}%")
+    lines.append(f"  粗利率:       {gross:.1f}%    営業利益率: {op_mg:.1f}%")
+    lines.append(f"  配当利回り:   {div_y:.2f}%    配当性向: {payout:.1f}%")
+    if de is not None: lines.append(f"  D/Eレシオ:    {de:.1f}%")
+
+    # ── 5年株価分析 ──
+    lines.append("\n[直近5年 株価動向]")
+    try:
+        df5 = yf.download(ticker, period="5y", progress=False, auto_adjust=True)
+        if df5 is None or len(df5) < 30:
+            raise ValueError("データ不足")
+        df5.columns = [c[0] if isinstance(c, tuple) else c for c in df5.columns]
+        close   = df5["Close"].squeeze()
+        current = float(close.iloc[-1])
+
+        # 年次リターン
+        lines.append("  年次リターン:")
+        for y in range(1, 6):
+            lb = y * 252
+            if len(close) > lb:
+                ret = (current / float(close.iloc[-lb]) - 1) * 100
+                bar = "▲" if ret > 0 else "▼"
+                lines.append(f"    {y}年前比: {bar} {abs(ret):.1f}%")
+
+        # 52週高値・安値
+        h52 = float(close.rolling(252).max().iloc[-1])
+        l52 = float(close.rolling(252).min().iloc[-1])
+        lines.append(f"\n  52週高値: {h52:.1f}  (現在{(current/h52-1)*100:+.1f}%)")
+        lines.append(f"  52週安値: {l52:.1f}  (現在{(current/l52-1)*100:+.1f}%)")
+
+        # 年別サマリー
+        df5["_yr"] = df5.index.year
+        lines.append("\n  年別サマリー (高値/安値/年間騰落):")
+        cur_yr = datetime.today().year
+        for yr in range(cur_yr - 4, cur_yr + 1):
+            yd = df5[df5["_yr"] == yr]
+            if len(yd) < 5: continue
+            yh  = float(yd["High"].max())
+            yl  = float(yd["Low"].min())
+            c0  = float(yd["Close"].iloc[0])
+            ce  = float(yd["Close"].iloc[-1])
+            ret = (ce / c0 - 1) * 100
+            bar = "▲" if ret > 0 else "▼"
+            lines.append(f"    {yr}年: 高値 {yh:>10.1f} / 安値 {yl:>10.1f} / {bar}{abs(ret):.1f}%")
+
+        # 主要な急騰・急落（週次±15%以上）
+        weekly = close.resample("W").last().pct_change() * 100
+        cutoff = pd.Timestamp.now() - pd.DateOffset(years=5)
+        big    = weekly[(weekly.abs() >= 15) & (weekly.index >= cutoff)].dropna()
+        if len(big) > 0:
+            lines.append("\n  主要な価格変動 (週次±15%以上):")
+            for dt, ret in big.reindex(big.abs().sort_values(ascending=False).index).head(8).items():
+                tag = "急騰▲" if ret > 0 else "急落▼"
+                lines.append(f"    {dt.strftime('%Y-%m-%d')}  {tag} {ret:+.1f}%")
+        else:
+            lines.append("\n  主要な価格変動: ±15%以上の週次変動なし")
+
+    except Exception as e:
+        lines.append(f"  (株価データ取得失敗: {e})")
+
+    # ── 直近ニュース ──
+    lines.append("\n[直近ニュース]")
+    try:
+        news_list = yf.Ticker(ticker).news or []
+        shown = 0
+        for n in news_list[:20]:
+            title  = n.get("title") or (n.get("content") or {}).get("title", "")
+            pub_ts = n.get("providerPublishTime") or 0
+            pub_dt = datetime.fromtimestamp(pub_ts).strftime("%Y-%m-%d") if pub_ts else "N/A"
+            if title:
+                lines.append(f"  [{pub_dt}] {title}")
+                shown += 1
+            if shown >= 7: break
+        if shown == 0:
+            lines.append("  (ニュース取得なし)")
+    except Exception:
+        lines.append("  (ニュース取得失敗)")
+
+    return "\n".join(lines)
+
+
+def save_analysis(results: list):
+    """注目銘柄（マッチ数>=2）の詳細分析テキストを出力"""
+    top = [r for r in results if r["マッチ戦略数"] >= 2]
+    if not top:
+        return
+
+    print(f"\n詳細分析生成中... ({len(top)}銘柄)")
+    path_ana = os.path.join(OUTPUT_DIR, "screening_analysis.txt")
+
+    with open(path_ana, "w", encoding="utf-8") as f:
+        f.write("=" * 68 + "\n")
+        f.write(f" 注目銘柄 詳細分析レポート ({TODAY})\n")
+        f.write(f" 対象: マッチ戦略数 >= 2  ({len(top)}銘柄)\n")
+        f.write(f" 内容: 四季報情報 / 財務指標 / 5年株価動向 / 直近ニュース\n")
+        f.write("=" * 68 + "\n")
+
+        for i, r in enumerate(top, 1):
+            ticker = r["銘柄コード"]
+            market = r["市場"]
+            print(f"  [{i}/{len(top)}] {ticker} 分析中...")
+            info     = fetch_info(ticker)
+            analysis = generate_stock_analysis(ticker, info, market)
+            f.write(analysis + "\n")
+            time.sleep(0.3)
+
+    print(f"[保存] 詳細分析:   {path_ana}")
+
+
 if __name__ == "__main__":
     results = run_all_screens()
     save_results(results)
+    save_analysis(results)
