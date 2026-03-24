@@ -770,6 +770,13 @@ def save_results(results: list):
         f.write("【戦略別ヒット数】\n")
         f.write(df_sum.to_string(index=False) + "\n\n")
 
+        # 注目銘柄（マッチ数上位）
+        top = df_all[df_all["マッチ戦略数"] >= 2].head(15)
+        if len(top):
+            f.write("【注目銘柄（マッチ数上位）】\n")
+            top_cols = ["市場","銘柄コード","現在値","RSI14","PER","ROE(%)","売上成長(%)","粗利率(%)","マッチ戦略数","マッチ戦略"]
+            f.write(top[top_cols].to_string(index=False) + "\n\n")
+
         f.write("【国内株 ヒット銘柄】\n")
         df_jp = df_all[df_all["市場"]=="JP"]
         f.write((df_jp[cols].to_string(index=False) if len(df_jp) else "  なし") + "\n\n")
