@@ -16,6 +16,64 @@ import time
 import os
 from datetime import datetime
 
+# ── PDF 生成 ──────────────────────────────
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.platypus import (SimpleDocTemplate, Paragraph, Table, TableStyle,
+                                 Spacer, PageBreak, HRFlowable)
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+
+# 日本語フォント設定（Yu Gothic / BIZ-UDGothic / CIDフォント の順で試行）
+_FONT_CANDIDATES = [
+    ("/mnt/c/Windows/Fonts/YuGothR.ttc",  "YuGothic",     "YuGothic"),
+    ("/mnt/c/Windows/Fonts/YuGothB.ttc",  "YuGothicBold", "YuGothicBold"),
+    ("/mnt/c/Windows/Fonts/BIZ-UDGothicR.ttc", "BIZGothic",     "BIZGothic"),
+    ("/mnt/c/Windows/Fonts/BIZ-UDGothicB.ttc", "BIZGothicBold", "BIZGothicBold"),
+]
+_FONT_NORMAL = "HeiseiKakuGo-W5"
+_FONT_BOLD   = "HeiseiKakuGo-W5"
+_using_ttf   = False
+
+_reg_normal, _reg_bold = None, None
+for _path, _reg, _ in _FONT_CANDIDATES:
+    if os.path.exists(_path):
+        try:
+            pdfmetrics.registerFont(TTFont(_reg, _path))
+            if _reg_normal is None:
+                _reg_normal = _reg
+            elif _reg_bold is None:
+                _reg_bold = _reg
+        except Exception:
+            pass
+
+if _reg_normal:
+    _FONT_NORMAL = _reg_normal
+    _FONT_BOLD   = _reg_bold or _reg_normal
+    _using_ttf   = True
+    # フォントファミリー登録（ps2tt対応）
+    pdfmetrics.registerFontFamily(_reg_normal,
+                                  normal=_reg_normal,
+                                  bold=_FONT_BOLD,
+                                  italic=_reg_normal,
+                                  boldItalic=_FONT_BOLD)
+else:
+    pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
+
+# カラーパレット
+C_NAVY   = colors.HexColor("#1a3a5c")
+C_BLUE   = colors.HexColor("#2563a8")
+C_LBLUE  = colors.HexColor("#dbeafe")
+C_ORANGE = colors.HexColor("#f57c00")
+C_GREEN  = colors.HexColor("#15803d")
+C_RED    = colors.HexColor("#dc2626")
+C_LGRAY  = colors.HexColor("#f5f5f5")
+C_WHITE  = colors.white
+C_BLACK  = colors.black
+
 # ─────────────────────────────────────────
 # 設定
 # ─────────────────────────────────────────
@@ -675,14 +733,197 @@ STRATEGIES = {
 }
 
 # ─────────────────────────────────────────
+# グロース重視スコアリング & リスク判定
+# ─────────────────────────────────────────
+# スコアを2倍にするグロース系戦略
+GROWTH_STRATEGIES = {
+    "A-1","A-2","A-3",          # モメンタム
+    "B-1","B-2","B-3",          # グロース×クオリティ
+    "F-1","F-2",                 # テーマ成長
+    "G-1","G-2",                 # CANSLIM
+    "H-1","H-3",                 # 複合グロース
+    "I-1","I-3",                 # 高ROIC・小型プレミアム
+}
+
+def calc_growth_score(r: dict) -> float:
+    """グロース重視スコア（高いほど推奨度高）"""
+    score = 0.0
+    for s in r["マッチ戦略"].split(" | "):
+        score += 2.0 if s[:3] in GROWTH_STRATEGIES else 1.0
+
+    rev_grw = r.get("売上成長(%)", 0) or 0
+    if   rev_grw >= 50: score += 5
+    elif rev_grw >= 30: score += 3
+    elif rev_grw >= 20: score += 2
+    elif rev_grw >= 10: score += 1
+
+    gross = r.get("粗利率(%)", 0) or 0
+    if   gross >= 70: score += 3
+    elif gross >= 50: score += 2
+    elif gross >= 35: score += 1
+
+    roe = r.get("ROE(%)", 0) or 0
+    if   roe >= 30: score += 2
+    elif roe >= 15: score += 1
+
+    rsi = r.get("RSI14") or 0
+    if 52 <= rsi <= 72: score += 1   # 上昇トレンド理想ゾーン
+
+    return round(score, 1)
+
+
+def is_high_risk(df: pd.DataFrame, info: dict) -> bool:
+    """ハイリスク銘柄判定（True = 除外対象）"""
+    try:
+        latest = df.iloc[-1]
+        rsi = float(latest.RSI14) if not pd.isna(latest.RSI14) else 0
+        if rsi > 80: return True                          # 過熱
+
+        if not pd.isna(latest.DEV_SMA200) and latest.DEV_SMA200 > 60:
+            return True                                   # 200日線から60%超乖離
+
+        vol = df["Close"].pct_change().iloc[-60:].std() * np.sqrt(252)
+        if not np.isnan(vol) and vol > 0.85: return True  # 年率85%超のボラ
+    except Exception:
+        pass
+    return False
+
+
+def generate_buy_reasons(r: dict, df: pd.DataFrame, info: dict, market: str):
+    """(推奨理由リスト, リスク要因リスト, シナリオ文字列) を返す"""
+    reasons, risks = [], []
+
+    rev_grw = r.get("売上成長(%)", 0) or 0
+    gross   = r.get("粗利率(%)", 0) or 0
+    roe     = r.get("ROE(%)", 0) or 0
+    rsi     = r.get("RSI14") or 0
+    per     = r.get("PER") or 0
+    matched = r["マッチ戦略"].split(" | ")
+
+    # ── グロース理由 ──
+    if rev_grw >= 30:
+        reasons.append(f"売上高 {rev_grw:.0f}%成長（高成長フェーズ継続中）")
+    elif rev_grw >= 15:
+        reasons.append(f"売上高 {rev_grw:.0f}%成長（安定高成長）")
+
+    if gross >= 60:
+        reasons.append(f"粗利率 {gross:.0f}%（高収益ビジネスモデル）")
+    elif gross >= 40:
+        reasons.append(f"粗利率 {gross:.0f}%（スケーラブルな事業構造）")
+
+    if roe >= 20:
+        reasons.append(f"ROE {roe:.0f}%（高い資本効率・株主価値向上力）")
+    elif roe >= 12:
+        reasons.append(f"ROE {roe:.0f}%（安定した収益力）")
+
+    # ── テクニカル理由 ──
+    if 55 <= rsi <= 72:
+        reasons.append(f"RSI {rsi:.0f}（上昇トレンドの理想ゾーン・過熱感なし）")
+    try:
+        latest = df.iloc[-1]
+        p = MARKET_PARAMS[market]
+        sm, sl = float(latest[p["sma_m"]]), float(latest[p["sma_l"]])
+        cl = float(latest.Close)
+        if cl > sm > sl:
+            reasons.append("株価が中期・長期移動平均線の上位に位置（上昇トレンド確認）")
+        adx = float(latest.ADX) if not pd.isna(latest.ADX) else 0
+        if adx > 28:
+            reasons.append(f"ADX {adx:.0f}（強いトレンドの存在を示す）")
+        ret60 = float(latest.RET_60D) if not pd.isna(latest.RET_60D) else 0
+        if ret60 > 15:
+            reasons.append(f"直近60日で {ret60:.0f}%上昇（高い相対強度）")
+    except Exception:
+        pass
+
+    # ── 戦略シグナル理由 ──
+    _key = {
+        "B-1": "Rule of 40達成（成長率＋利益率≧40%）",
+        "G-1": "CANSLIM全条件クリア（最強グロースシグナル）",
+        "H-1": "グロース×モメンタム×クオリティ三軸クリア",
+        "A-1": "52週高値ブレイクアウト＋出来高急増",
+        "F-1": "AI・データインフラ テーマリーダー",
+        "I-1": "高ROIC（資本効率最高クラス）",
+        "A-2": "多重MA完全順列＋強トレンド確認",
+    }
+    for s in matched:
+        if s[:3] in _key:
+            reasons.append(_key[s[:3]])
+            break
+
+    # ── リスク要因 ──
+    if rsi > 70:
+        risks.append(f"RSI {rsi:.0f}（やや過熱気味・短期調整に注意）")
+    if per and per > 80:
+        risks.append(f"PER {per:.0f}倍（高バリュエーション・業績の高期待が織り込まれている）")
+    try:
+        vol = df["Close"].pct_change().iloc[-60:].std() * np.sqrt(252) * 100
+        if vol > 50:
+            risks.append(f"年率ボラティリティ {vol:.0f}%（価格変動が大きい）")
+    except Exception:
+        pass
+    if not risks:
+        risks.append("特段の高リスク要因なし（ベースフィルター・ハイリスク除外済）")
+
+    # ── シナリオ ──
+    try:
+        cl = float(df.iloc[-1].Close)
+        h52 = float(df["Close"].rolling(252).max().iloc[-1])
+        tgt = max(h52 * 1.05, cl * 1.20)
+        stop = cl * 0.88
+        currency = "円" if market == "JP" else "USD"
+        scenario = (f"目標: {tgt:.1f}{currency} ({(tgt/cl-1)*100:+.0f}%) /"
+                    f" 撤退ライン: {stop:.1f}{currency} (-12%)")
+    except Exception:
+        scenario = "目標・撤退ラインはご自身でご判断ください"
+
+    return reasons[:5], risks[:3], scenario
+
+
+# ─────────────────────────────────────────
+# PDF ヘルパー
+# ─────────────────────────────────────────
+def _style(name, **kw):
+    base = dict(fontName=_FONT_NORMAL, fontSize=10, leading=16,
+                textColor=C_BLACK, spaceAfter=4)
+    base.update(kw)
+    return ParagraphStyle(name, **base)
+
+
+def _p(text, s): return Paragraph(text, s)
+
+
+def _tbl(data, col_widths, row_styles=None):
+    t = Table(data, colWidths=col_widths, repeatRows=1)
+    base = [
+        ("BACKGROUND", (0,0), (-1,0), C_NAVY),
+        ("TEXTCOLOR",  (0,0), (-1,0), C_WHITE),
+        ("FONTNAME",   (0,0), (-1,0), _FONT_BOLD),
+        ("FONTSIZE",   (0,0), (-1,0), 9),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [C_WHITE, C_LGRAY]),
+        ("FONTNAME",   (0,1), (-1,-1), _FONT_NORMAL),
+        ("FONTSIZE",   (0,1), (-1,-1), 9),
+        ("GRID",       (0,0), (-1,-1), 0.4, colors.HexColor("#cccccc")),
+        ("VALIGN",     (0,0), (-1,-1), "MIDDLE"),
+        ("TOPPADDING", (0,0), (-1,-1), 4),
+        ("BOTTOMPADDING",(0,0),(-1,-1), 4),
+        ("LEFTPADDING", (0,0), (-1,-1), 5),
+    ]
+    if row_styles:
+        base += row_styles
+    t.setStyle(TableStyle(base))
+    return t
+
+
+# ─────────────────────────────────────────
 # メイン実行
 # ─────────────────────────────────────────
 def run_all_screens():
+    """スクリーニング実行。(results, stock_data_raw) を返す"""
     print("\nスクリーニング実行中...")
-    stock_data = fetch_stock_data(STOCK_UNIVERSE, period="2y")
+    stock_data_raw = fetch_stock_data(STOCK_UNIVERSE, period="2y")
 
     results = []
-    for ticker, raw_df in stock_data.items():
+    for ticker, raw_df in stock_data_raw.items():
         try:
             market = MARKET_MAP.get(ticker, "US")
             df     = calc_indicators(raw_df)
@@ -700,11 +941,12 @@ def run_all_screens():
                     pass
 
             if hit:
-                r      = df.iloc[-1]
-                mktcap = info.get("marketCap")
-                results.append({
+                r   = df.iloc[-1]
+                rec = {
                     "市場":          market,
                     "銘柄コード":    ticker,
+                    "銘柄名":        info.get("longName") or info.get("shortName") or ticker,
+                    "セクター":      info.get("sector") or "N/A",
                     "現在値":        round(float(r.Close), 1),
                     "RSI14":         round(float(r.RSI14), 1) if not pd.isna(r.RSI14) else None,
                     "PER":           round(info.get("trailingPE") or 0, 1) or None,
@@ -712,250 +954,447 @@ def run_all_screens():
                     "ROE(%)":        round((info.get("returnOnEquity") or 0) * 100, 1),
                     "売上成長(%)":   round((info.get("revenueGrowth") or 0) * 100, 1),
                     "粗利率(%)":     round((info.get("grossMargins") or 0) * 100, 1),
+                    "営業利益率(%)": round((info.get("operatingMargins") or 0) * 100, 1),
                     "マッチ戦略数":  len(hit),
                     "マッチ戦略":    " | ".join(hit),
-                })
+                    "ハイリスク":    is_high_risk(df, info),
+                    "_info":         info,
+                }
+                rec["グロース評価スコア"] = calc_growth_score(rec)
+                results.append(rec)
         except Exception:
             pass
 
-    return sorted(results, key=lambda x: (-x["マッチ戦略数"], x["市場"], x["銘柄コード"]))
+    results_sorted = sorted(results,
+                            key=lambda x: (-x["グロース評価スコア"], x["市場"], x["銘柄コード"]))
+    return results_sorted, stock_data_raw
 
-def save_results(results: list):
+
+# ─────────────────────────────────────────
+# PDF出力①: 分析レポート
+# ─────────────────────────────────────────
+def save_analysis_pdf(results: list, stock_data: dict):
+    """スクリーニング全体の分析レポートPDF"""
     if not results:
-        print("ヒット銘柄なし")
-        return
+        print("ヒット銘柄なし"); return
 
-    df_all = pd.DataFrame(results)
+    path = os.path.join(OUTPUT_DIR, "analysis_report.pdf")
+    doc  = SimpleDocTemplate(path, pagesize=A4,
+                             leftMargin=15*mm, rightMargin=15*mm,
+                             topMargin=15*mm, bottomMargin=15*mm)
+
+    # スタイル定義
+    s_title  = _style("title",  fontSize=20, fontName=_FONT_BOLD,
+                      textColor=C_NAVY, spaceAfter=6, leading=26)
+    s_sub    = _style("sub",    fontSize=13, fontName=_FONT_BOLD,
+                      textColor=C_BLUE, spaceAfter=4, leading=18)
+    s_h2     = _style("h2",     fontSize=11, fontName=_FONT_BOLD,
+                      textColor=C_NAVY, spaceAfter=4, leading=16)
+    s_body   = _style("body",   fontSize=9,  leading=14, spaceAfter=3)
+    s_small  = _style("small",  fontSize=8,  leading=12, spaceAfter=2,
+                      textColor=colors.HexColor("#555555"))
+    s_bullet = _style("bullet", fontSize=9,  leading=14, leftIndent=10,
+                      spaceAfter=2)
+
     jp_hits = [r for r in results if r["市場"] == "JP"]
     us_hits = [r for r in results if r["市場"] == "US"]
+    top = [r for r in results if r["グロース評価スコア"] >= 5]
 
-    # CSV
-    df_all.to_csv(os.path.join(OUTPUT_DIR, "screening_all.csv"), index=False, encoding="utf-8-sig")
-    print(f"[保存] 全銘柄統合: {OUTPUT_DIR}/screening_all.csv")
+    elems = []
 
-    rows = []
-    for r in results:
-        for s in r["マッチ戦略"].split(" | "):
-            row = r.copy(); row["戦略"] = s; rows.append(row)
-    pd.DataFrame(rows).to_csv(os.path.join(OUTPUT_DIR, "screening_by_strategy.csv"), index=False, encoding="utf-8-sig")
-    print(f"[保存] 戦略別:    {OUTPUT_DIR}/screening_by_strategy.csv")
+    # ── 表紙 ──────────────────────────────────
+    elems += [
+        Spacer(1, 20*mm),
+        _p("株式スクリーニング 分析レポート", s_title),
+        _p(f"実行日: {TODAY}　|　対象: 国内株式 / 米国株式　|　全27戦略", s_body),
+        HRFlowable(width="100%", thickness=2, color=C_NAVY, spaceAfter=8),
+        Spacer(1, 4*mm),
+    ]
 
-    summary = []
+    # サマリーボックス（表）
+    summary_data = [
+        ["項目", "件数"],
+        ["スキャン銘柄数（JP）", f"{_n_jp}銘柄"],
+        ["スキャン銘柄数（US）", f"{_n_us}銘柄"],
+        [f"ヒット銘柄数（JP）", f"{len(jp_hits)}銘柄"],
+        [f"ヒット銘柄数（US）", f"{len(us_hits)}銘柄"],
+        ["グロース注目銘柄（スコア5以上）", f"{len(top)}銘柄"],
+    ]
+    elems.append(_tbl(summary_data, [120*mm, 50*mm]))
+    elems.append(Spacer(1, 8*mm))
+
+    # ── 戦略別ヒット数 ──────────────────────────
+    elems += [
+        _p("■ 戦略別ヒット数", s_sub),
+        HRFlowable(width="100%", thickness=0.5, color=C_BLUE, spaceAfter=4),
+    ]
+    strat_data = [["戦略", "JP", "US", "合計", "JP銘柄", "US銘柄"]]
     for name in STRATEGIES:
         hits = [r for r in results if name in r["マッチ戦略"]]
-        jp_s = [r["銘柄コード"] for r in hits if r["市場"]=="JP"]
-        us_s = [r["銘柄コード"] for r in hits if r["市場"]=="US"]
-        summary.append({
-            "戦略": name,
-            "JP": len(jp_s), "US": len(us_s),
-            "合計": len(hits),
-            "JP銘柄": ",".join(jp_s),
-            "US銘柄": ",".join(us_s),
-        })
-    df_sum = pd.DataFrame(summary)
-    df_sum.to_csv(os.path.join(OUTPUT_DIR, "screening_summary.csv"), index=False, encoding="utf-8-sig")
-    print(f"[保存] サマリー:   {OUTPUT_DIR}/screening_summary.csv")
+        jp_s = [r["銘柄コード"] for r in hits if r["市場"] == "JP"]
+        us_s = [r["銘柄コード"] for r in hits if r["市場"] == "US"]
+        strat_data.append([name, str(len(jp_s)), str(len(us_s)), str(len(hits)),
+                           ", ".join(jp_s) or "-", ", ".join(us_s) or "-"])
+    elems.append(_tbl(strat_data, [52*mm, 10*mm, 10*mm, 10*mm, 47*mm, 47*mm]))
+    elems.append(PageBreak())
 
-    # TXT レポート
-    path_txt = os.path.join(OUTPUT_DIR, "screening_report.txt")
-    cols = ["市場","銘柄コード","現在値","RSI14","PER","PBR","ROE(%)","売上成長(%)","粗利率(%)","マッチ戦略数","マッチ戦略"]
-    with open(path_txt, "w", encoding="utf-8") as f:
-        f.write("=" * 70 + "\n")
-        f.write(f" スクリーニング結果 ({TODAY})\n")
-        f.write(f" 対象: 国内株式 / 米国株式  |  全27戦略\n")
-        f.write("=" * 70 + "\n")
-        f.write(f"スキャン銘柄数: {len(STOCK_UNIVERSE)}  (JP:{_n_jp} / US:{_n_us})\n")
-        f.write(f"ヒット銘柄数:   {len(results)}  (JP:{len(jp_hits)} / US:{len(us_hits)})\n\n")
+    # ── 注目銘柄一覧（グロース評価スコア順） ──────
+    elems += [
+        _p("■ スクリーニングヒット銘柄一覧（グロース評価スコア順）", s_sub),
+        HRFlowable(width="100%", thickness=0.5, color=C_BLUE, spaceAfter=4),
+        _p("※ グロース評価スコア: 成長系戦略を2倍、売上成長・粗利率・ROEにボーナス加算", s_small),
+        Spacer(1, 3*mm),
+    ]
+    all_data = [["市場", "コード", "銘柄名", "スコア", "現在値",
+                 "RSI", "売上成長%", "粗利率%", "ROE%", "マッチ数", "リスク"]]
+    for r in results:
+        name_short = (r.get("銘柄名") or r["銘柄コード"])[:18]
+        risk_str = "⚠" if r.get("ハイリスク") else "○"
+        all_data.append([
+            r["市場"], r["銘柄コード"], name_short,
+            str(r["グロース評価スコア"]),
+            str(r["現在値"]),
+            str(r.get("RSI14") or "-"),
+            f"{r.get('売上成長(%)',0):.0f}%",
+            f"{r.get('粗利率(%)',0):.0f}%",
+            f"{r.get('ROE(%)',0):.0f}%",
+            str(r["マッチ戦略数"]),
+            risk_str,
+        ])
+    elems.append(_tbl(all_data,
+                      [10*mm, 18*mm, 38*mm, 14*mm, 18*mm,
+                       10*mm, 18*mm, 15*mm, 12*mm, 15*mm, 10*mm]))
+    elems.append(PageBreak())
 
-        f.write("【戦略別ヒット数】\n")
-        f.write(df_sum.to_string(index=False) + "\n\n")
+    # ── 注目銘柄 詳細（スコア上位、ハイリスク除外） ──
+    elems += [_p("■ 注目銘柄 詳細分析", s_sub),
+              HRFlowable(width="100%", thickness=0.5, color=C_BLUE, spaceAfter=6)]
 
-        # 注目銘柄（マッチ数上位）
-        top = df_all[df_all["マッチ戦略数"] >= 2].head(15)
-        if len(top):
-            f.write("【注目銘柄（マッチ数上位）】\n")
-            top_cols = ["市場","銘柄コード","現在値","RSI14","PER","ROE(%)","売上成長(%)","粗利率(%)","マッチ戦略数","マッチ戦略"]
-            f.write(top[top_cols].to_string(index=False) + "\n\n")
+    detail_targets = [r for r in results
+                      if r["グロース評価スコア"] >= 4 and not r.get("ハイリスク")][:12]
+    print(f"\n詳細分析生成中... ({len(detail_targets)}銘柄)")
 
-        f.write("【国内株 ヒット銘柄】\n")
-        df_jp = df_all[df_all["市場"]=="JP"]
-        f.write((df_jp[cols].to_string(index=False) if len(df_jp) else "  なし") + "\n\n")
+    for i, r in enumerate(detail_targets, 1):
+        ticker = r["銘柄コード"]
+        market = r["市場"]
+        info   = r.get("_info") or fetch_info(ticker)
+        print(f"  [{i}/{len(detail_targets)}] {ticker} ...")
 
-        f.write("【米国株 ヒット銘柄】\n")
-        df_us = df_all[df_all["市場"]=="US"]
-        f.write((df_us[cols].to_string(index=False) if len(df_us) else "  なし") + "\n")
-    print(f"[保存] レポート:   {path_txt}")
+        name    = info.get("longName") or info.get("shortName") or ticker
+        sector  = info.get("sector") or "N/A"
+        mktcap  = info.get("marketCap") or 0
+        mktcap_s = (f"{mktcap/1e8:.0f}億円" if market=="JP" else f"${mktcap/1e9:.1f}B") if mktcap else "N/A"
+        per_v   = info.get("trailingPE")
+        pbr_v   = info.get("priceToBook")
+        roe_v   = (info.get("returnOnEquity") or 0) * 100
+        roa_v   = (info.get("returnOnAssets") or 0) * 100
+        gross_v = (info.get("grossMargins")   or 0) * 100
+        op_v    = (info.get("operatingMargins") or 0) * 100
+        rev_v   = (info.get("revenueGrowth")  or 0) * 100
+        div_v   = (info.get("dividendYield")  or 0) * 100
+        de_v    = info.get("debtToEquity")
+        desc    = (info.get("longBusinessSummary") or "")[:300]
 
-    # コンソール出力
-    print("\n" + "=" * 70)
-    print(f" スクリーニング結果 ({TODAY})")
-    print(f" 対象: 国内株式 / 米国株式  |  全27戦略")
-    print("=" * 70)
-    print(f"スキャン銘柄数: {len(STOCK_UNIVERSE)}  (JP:{_n_jp} / US:{_n_us})")
-    print(f"ヒット銘柄数:   {len(results)}  (JP:{len(jp_hits)} / US:{len(us_hits)})\n")
-    print(df_sum.to_string(index=False))
-    print("\n【国内株 ヒット銘柄】")
-    print(df_all[df_all["市場"]=="JP"][cols].to_string(index=False) if len(jp_hits) else "  なし")
-    print("\n【米国株 ヒット銘柄】")
-    print(df_all[df_all["市場"]=="US"][cols].to_string(index=False) if len(us_hits) else "  なし")
+        # 銘柄ヘッダー
+        elems += [
+            _p(f"{ticker}　{name}", _style(f"hd{i}", fontSize=12, fontName=_FONT_BOLD,
+               textColor=C_NAVY, spaceAfter=2, leading=16)),
+            _p(f"市場: {market}　|　セクター: {sector}　|　スコア: {r['グロース評価スコア']}",
+               s_small),
+            Spacer(1, 2*mm),
+        ]
+
+        # 事業概要
+        if desc:
+            elems.append(_p(desc + ("..." if len(info.get("longBusinessSummary","")) > 300 else ""), s_small))
+            elems.append(Spacer(1, 2*mm))
+
+        # 財務指標テーブル
+        fin_data = [
+            ["指標", "値", "指標", "値"],
+            ["時価総額", mktcap_s, "売上成長率", f"{rev_v:.1f}%"],
+            ["PER", f"{per_v:.1f}倍" if per_v else "N/A", "粗利率", f"{gross_v:.1f}%"],
+            ["PBR", f"{pbr_v:.2f}倍" if pbr_v else "N/A", "営業利益率", f"{op_v:.1f}%"],
+            ["ROE", f"{roe_v:.1f}%", "ROA", f"{roa_v:.1f}%"],
+            ["配当利回り", f"{div_v:.2f}%", "D/Eレシオ", f"{de_v:.1f}" if de_v else "N/A"],
+        ]
+        elems.append(_tbl(fin_data, [35*mm, 35*mm, 35*mm, 35*mm]))
+        elems.append(Spacer(1, 3*mm))
+
+        # 5年株価動向
+        try:
+            df5 = yf.download(ticker, period="5y", progress=False, auto_adjust=True)
+            if df5 is not None and len(df5) >= 30:
+                df5.columns = [c[0] if isinstance(c, tuple) else c for c in df5.columns]
+                cl5 = df5["Close"].squeeze()
+                cur = float(cl5.iloc[-1])
+                h52 = float(cl5.rolling(252).max().iloc[-1])
+                l52 = float(cl5.rolling(252).min().iloc[-1])
+
+                ret_lines = []
+                for y in [1, 2, 3]:
+                    lb = y * 252
+                    if len(cl5) > lb:
+                        ret = (cur / float(cl5.iloc[-lb]) - 1) * 100
+                        ret_lines.append(f"{y}年前比: {'▲' if ret>0 else '▼'}{abs(ret):.0f}%")
+
+                price_data = [
+                    ["", ""],
+                    ["52週高値", f"{h52:.1f}　(現在比 {(cur/h52-1)*100:+.0f}%)"],
+                    ["52週安値", f"{l52:.1f}　(現在比 {(cur/l52-1)*100:+.0f}%)"],
+                    ["年次リターン", "　|　".join(ret_lines)],
+                ]
+                price_data[0] = ["株価動向", ""]
+                elems.append(_tbl(price_data, [40*mm, 140*mm],
+                                  [("SPAN", (0,0), (-1,0)),
+                                   ("BACKGROUND", (0,0), (-1,0), C_LBLUE),
+                                   ("TEXTCOLOR", (0,0), (-1,0), C_NAVY),
+                                   ("FONTNAME", (0,0), (-1,0), _FONT_BOLD)]))
+                elems.append(Spacer(1, 2*mm))
+        except Exception:
+            pass
+
+        # 直近ニュース
+        try:
+            news_list = yf.Ticker(ticker).news or []
+            news_shown = []
+            for n in news_list[:15]:
+                title  = n.get("title") or (n.get("content") or {}).get("title", "")
+                pub_ts = n.get("providerPublishTime") or 0
+                pub_dt = datetime.fromtimestamp(pub_ts).strftime("%m/%d") if pub_ts else "-"
+                if title:
+                    news_shown.append(f"[{pub_dt}] {title[:70]}")
+                if len(news_shown) >= 5: break
+            if news_shown:
+                nd = [["直近ニュース"]] + [[n] for n in news_shown]
+                elems.append(_tbl(nd, [180*mm],
+                                  [("SPAN", (0,0), (-1,0)),
+                                   ("BACKGROUND", (0,0), (-1,0), C_LBLUE),
+                                   ("TEXTCOLOR", (0,0), (-1,0), C_NAVY),
+                                   ("FONTNAME", (0,0), (-1,0), _FONT_BOLD)]))
+        except Exception:
+            pass
+
+        elems.append(Spacer(1, 6*mm))
+        elems.append(HRFlowable(width="100%", thickness=0.3,
+                                color=colors.HexColor("#cccccc"), spaceAfter=6))
+        time.sleep(0.2)
+
+    doc.build(elems)
+    print(f"[保存] 分析レポート: {path}")
+
 
 # ─────────────────────────────────────────
-# 注目銘柄 詳細分析
+# PDF出力②: 今買うべき銘柄レポート
 # ─────────────────────────────────────────
-def generate_stock_analysis(ticker: str, info: dict, market: str) -> str:
-    """個別銘柄の四季報的情報 + 5年株価分析 + ニュース"""
-    lines = []
+def save_recommendation_pdf(results: list, stock_data: dict):
+    """今買うべき銘柄レポートPDF（グロース重視・ハイリスク除外）"""
+    # ハイリスク除外 → グロース評価スコア降順 → 上位10銘柄
+    candidates = [r for r in results if not r.get("ハイリスク") and r["マッチ戦略数"] >= 2]
+    candidates = sorted(candidates, key=lambda x: -x["グロース評価スコア"])[:10]
 
-    name     = info.get("longName") or info.get("shortName") or ticker
-    sector   = info.get("sector") or "N/A"
-    industry = info.get("industry") or "N/A"
-    country  = info.get("country") or ""
-    emp      = info.get("fullTimeEmployees")
-    website  = info.get("website") or ""
+    if not candidates:
+        print("推奨候補なし"); return
 
-    lines.append(f"\n{'━'*68}")
-    lines.append(f"■ {ticker}  {name}")
-    lines.append(f"  市場: {market} | セクター: {sector} | 業種: {industry}")
-    if country: lines.append(f"  国: {country}" + (f" | Web: {website}" if website else ""))
-    if emp:     lines.append(f"  従業員数: {emp:,}人")
-    lines.append(f"{'━'*68}")
+    path = os.path.join(OUTPUT_DIR, "buy_recommendation.pdf")
+    doc  = SimpleDocTemplate(path, pagesize=A4,
+                             leftMargin=15*mm, rightMargin=15*mm,
+                             topMargin=15*mm, bottomMargin=15*mm)
 
-    # ── 事業概要 ──
-    desc = (info.get("longBusinessSummary") or "")[:500]
-    if desc:
-        lines.append("\n[事業概要]")
-        lines.append(f"  {desc}" + ("..." if len(info.get('longBusinessSummary','')) > 500 else ""))
+    s_title  = _style("rt",  fontSize=22, fontName=_FONT_BOLD,
+                      textColor=C_NAVY, spaceAfter=6, leading=28)
+    s_sub    = _style("rs",  fontSize=13, fontName=_FONT_BOLD,
+                      textColor=C_BLUE, spaceAfter=4, leading=18)
+    s_h2     = _style("rh2", fontSize=12, fontName=_FONT_BOLD,
+                      textColor=C_NAVY, spaceAfter=3, leading=16)
+    s_body   = _style("rb",  fontSize=9,  leading=14, spaceAfter=3)
+    s_small  = _style("rsm", fontSize=8,  leading=12, spaceAfter=2,
+                      textColor=colors.HexColor("#555555"))
+    s_bullet = _style("rbul", fontSize=10, leading=16, leftIndent=12, spaceAfter=3)
+    s_risk   = _style("rrsk", fontSize=9,  leading=14, leftIndent=12, spaceAfter=2,
+                      textColor=C_RED)
+    s_green  = _style("rgrn", fontSize=10, leading=14, leftIndent=12, spaceAfter=2,
+                      textColor=C_GREEN)
+    s_scenario = _style("rsc", fontSize=10, fontName=_FONT_BOLD, leading=16,
+                        textColor=C_ORANGE, spaceAfter=4)
 
-    # ── 財務指標 ──
-    mktcap  = info.get("marketCap") or 0
-    per     = info.get("trailingPE")
-    pbr     = info.get("priceToBook")
-    roe     = (info.get("returnOnEquity")    or 0) * 100
-    roa     = (info.get("returnOnAssets")    or 0) * 100
-    rev_grw = (info.get("revenueGrowth")     or 0) * 100
-    gross   = (info.get("grossMargins")      or 0) * 100
-    op_mg   = (info.get("operatingMargins")  or 0) * 100
-    div_y   = (info.get("dividendYield")     or 0) * 100
-    payout  = (info.get("payoutRatio")       or 0) * 100
-    de      = info.get("debtToEquity")
+    elems = []
 
-    mktcap_str = (f"{mktcap/1e8:.0f}億円" if market == "JP" else f"${mktcap/1e9:.1f}B") if mktcap else "N/A"
+    # ── 表紙 ──────────────────────────────────
+    elems += [
+        Spacer(1, 16*mm),
+        _p("今買うべき銘柄レポート", s_title),
+        _p("グロース重視 × ハイリスク除外 × 中期投資", s_sub),
+        _p(f"実行日: {TODAY}", s_body),
+        HRFlowable(width="100%", thickness=2, color=C_ORANGE, spaceAfter=8),
+        Spacer(1, 4*mm),
+        _p("【選定基準】", _style("sc", fontName=_FONT_BOLD, fontSize=10, spaceAfter=2)),
+        _p("• 27戦略スクリーニングで2以上の戦略にヒット", s_body),
+        _p("• グロース評価スコア上位（売上成長・粗利率・ROE・モメンタム加味）", s_body),
+        _p("• ハイリスク除外（RSI過熱・過大乖離・高ボラティリティを排除）", s_body),
+        _p("• 推奨順位は「今の買いやすさ」を加味したスコア順", s_body),
+        Spacer(1, 6*mm),
+    ]
 
-    lines.append("\n[財務指標]")
-    lines.append(f"  時価総額:     {mktcap_str}")
-    lines.append(f"  PER:          {per:.1f}倍" if per else "  PER:          N/A")
-    lines.append(f"  PBR:          {pbr:.2f}倍" if pbr else "  PBR:          N/A")
-    lines.append(f"  ROE:          {roe:.1f}%    ROA: {roa:.1f}%")
-    lines.append(f"  売上成長率:   {rev_grw:.1f}%")
-    lines.append(f"  粗利率:       {gross:.1f}%    営業利益率: {op_mg:.1f}%")
-    lines.append(f"  配当利回り:   {div_y:.2f}%    配当性向: {payout:.1f}%")
-    if de is not None: lines.append(f"  D/Eレシオ:    {de:.1f}%")
+    # 推奨銘柄一覧
+    ov_data = [["順位", "市場", "コード", "銘柄名", "スコア", "現在値", "売上成長%", "粗利率%", "ROE%"]]
+    for rank, r in enumerate(candidates, 1):
+        name_s = (r.get("銘柄名") or r["銘柄コード"])[:16]
+        ov_data.append([
+            str(rank), r["市場"], r["銘柄コード"], name_s,
+            str(r["グロース評価スコア"]),
+            str(r["現在値"]),
+            f"{r.get('売上成長(%)',0):.0f}%",
+            f"{r.get('粗利率(%)',0):.0f}%",
+            f"{r.get('ROE(%)',0):.0f}%",
+        ])
+    elems.append(_tbl(ov_data, [10*mm, 12*mm, 18*mm, 42*mm, 16*mm, 22*mm, 22*mm, 18*mm, 18*mm]))
+    elems.append(PageBreak())
 
-    # ── 5年株価分析 ──
-    lines.append("\n[直近5年 株価動向]")
-    try:
-        df5 = yf.download(ticker, period="5y", progress=False, auto_adjust=True)
-        if df5 is None or len(df5) < 30:
-            raise ValueError("データ不足")
-        df5.columns = [c[0] if isinstance(c, tuple) else c for c in df5.columns]
-        close   = df5["Close"].squeeze()
-        current = float(close.iloc[-1])
+    # ── 各銘柄詳細 ──────────────────────────────
+    print(f"\n推奨レポート生成中... ({len(candidates)}銘柄)")
+    for rank, r in enumerate(candidates, 1):
+        ticker = r["銘柄コード"]
+        market = r["市場"]
+        info   = r.get("_info") or fetch_info(ticker)
+        print(f"  [{rank}/{len(candidates)}] {ticker} ...")
 
-        # 年次リターン
-        lines.append("  年次リターン:")
-        for y in range(1, 6):
-            lb = y * 252
-            if len(close) > lb:
-                ret = (current / float(close.iloc[-lb]) - 1) * 100
-                bar = "▲" if ret > 0 else "▼"
-                lines.append(f"    {y}年前比: {bar} {abs(ret):.1f}%")
+        name   = info.get("longName") or info.get("shortName") or ticker
+        sector = info.get("sector") or "N/A"
 
-        # 52週高値・安値
-        h52 = float(close.rolling(252).max().iloc[-1])
-        l52 = float(close.rolling(252).min().iloc[-1])
-        lines.append(f"\n  52週高値: {h52:.1f}  (現在{(current/h52-1)*100:+.1f}%)")
-        lines.append(f"  52週安値: {l52:.1f}  (現在{(current/l52-1)*100:+.1f}%)")
-
-        # 年別サマリー
-        df5["_yr"] = df5.index.year
-        lines.append("\n  年別サマリー (高値/安値/年間騰落):")
-        cur_yr = datetime.today().year
-        for yr in range(cur_yr - 4, cur_yr + 1):
-            yd = df5[df5["_yr"] == yr]
-            if len(yd) < 5: continue
-            yh  = float(yd["High"].max())
-            yl  = float(yd["Low"].min())
-            c0  = float(yd["Close"].iloc[0])
-            ce  = float(yd["Close"].iloc[-1])
-            ret = (ce / c0 - 1) * 100
-            bar = "▲" if ret > 0 else "▼"
-            lines.append(f"    {yr}年: 高値 {yh:>10.1f} / 安値 {yl:>10.1f} / {bar}{abs(ret):.1f}%")
-
-        # 主要な急騰・急落（週次±15%以上）
-        weekly = close.resample("W").last().pct_change() * 100
-        cutoff = pd.Timestamp.now() - pd.DateOffset(years=5)
-        big    = weekly[(weekly.abs() >= 15) & (weekly.index >= cutoff)].dropna()
-        if len(big) > 0:
-            lines.append("\n  主要な価格変動 (週次±15%以上):")
-            for dt, ret in big.reindex(big.abs().sort_values(ascending=False).index).head(8).items():
-                tag = "急騰▲" if ret > 0 else "急落▼"
-                lines.append(f"    {dt.strftime('%Y-%m-%d')}  {tag} {ret:+.1f}%")
+        # 推奨理由・リスク・シナリオ取得
+        raw_df = stock_data.get(ticker)
+        if raw_df is not None:
+            df_ind = calc_indicators(raw_df)
         else:
-            lines.append("\n  主要な価格変動: ±15%以上の週次変動なし")
+            try:
+                raw_df = yf.download(ticker, period="2y", progress=False, auto_adjust=True)
+                raw_df.columns = [c[0] if isinstance(c, tuple) else c for c in raw_df.columns]
+                df_ind = calc_indicators(raw_df)
+            except Exception:
+                df_ind = pd.DataFrame()
 
-    except Exception as e:
-        lines.append(f"  (株価データ取得失敗: {e})")
+        reasons, risks, scenario = generate_buy_reasons(r, df_ind, info, market)
 
-    # ── 直近ニュース ──
-    lines.append("\n[直近ニュース]")
-    try:
-        news_list = yf.Ticker(ticker).news or []
-        shown = 0
-        for n in news_list[:20]:
-            title  = n.get("title") or (n.get("content") or {}).get("title", "")
-            pub_ts = n.get("providerPublishTime") or 0
-            pub_dt = datetime.fromtimestamp(pub_ts).strftime("%Y-%m-%d") if pub_ts else "N/A"
-            if title:
-                lines.append(f"  [{pub_dt}] {title}")
-                shown += 1
-            if shown >= 7: break
-        if shown == 0:
-            lines.append("  (ニュース取得なし)")
-    except Exception:
-        lines.append("  (ニュース取得失敗)")
+        # ── 銘柄ヘッダー ──
+        currency = "円" if market == "JP" else "USD"
+        elems += [
+            _p(f"#{rank}　{ticker}　{name}", _style(f"rh{rank}", fontSize=14,
+               fontName=_FONT_BOLD, textColor=C_NAVY, spaceAfter=2, leading=20)),
+            _p(f"市場: {market}　|　セクター: {sector}　|　現在値: {r['現在値']}{currency}"
+               f"　|　グロース評価スコア: {r['グロース評価スコア']}",
+               s_small),
+            HRFlowable(width="100%", thickness=1, color=C_ORANGE, spaceAfter=6),
+        ]
 
-    return "\n".join(lines)
+        # ── 買い推奨理由 ──
+        elems.append(_p("【今買うべき理由】", _style(f"rb{rank}", fontName=_FONT_BOLD,
+                        fontSize=11, textColor=C_GREEN, spaceAfter=3, leading=16)))
+        for reason in reasons:
+            elems.append(_p(f"✓　{reason}", s_green))
+
+        elems.append(Spacer(1, 3*mm))
+
+        # ── マッチ戦略 ──
+        elems += [
+            _p("【マッチ戦略シグナル】", _style(f"rm{rank}", fontName=_FONT_BOLD,
+               fontSize=10, textColor=C_BLUE, spaceAfter=2, leading=14)),
+            _p(r["マッチ戦略"].replace(" | ", "　|　"), s_body),
+            Spacer(1, 3*mm),
+        ]
+
+        # ── 財務指標（コンパクト） ──
+        mktcap = info.get("marketCap") or 0
+        mktcap_s = (f"{mktcap/1e8:.0f}億円" if market=="JP" else f"${mktcap/1e9:.1f}B") if mktcap else "N/A"
+        per_v  = info.get("trailingPE")
+        pbr_v  = info.get("priceToBook")
+        roe_v  = (info.get("returnOnEquity") or 0) * 100
+        rev_v  = (info.get("revenueGrowth")  or 0) * 100
+        gross_v= (info.get("grossMargins")   or 0) * 100
+        op_v   = (info.get("operatingMargins") or 0) * 100
+
+        fin_data = [
+            ["時価総額", "PER", "PBR", "ROE", "売上成長", "粗利率", "営業利益率"],
+            [mktcap_s,
+             f"{per_v:.0f}倍" if per_v else "N/A",
+             f"{pbr_v:.1f}倍" if pbr_v else "N/A",
+             f"{roe_v:.0f}%",
+             f"{rev_v:.0f}%",
+             f"{gross_v:.0f}%",
+             f"{op_v:.0f}%"],
+        ]
+        elems.append(_tbl(fin_data, [28*mm, 22*mm, 22*mm, 18*mm, 22*mm, 18*mm, 28*mm]))
+        elems.append(Spacer(1, 3*mm))
+
+        # ── 5年リターン（コンパクト） ──
+        try:
+            df5 = yf.download(ticker, period="5y", progress=False, auto_adjust=True)
+            if df5 is not None and len(df5) >= 60:
+                df5.columns = [c[0] if isinstance(c, tuple) else c for c in df5.columns]
+                cl5 = df5["Close"].squeeze()
+                cur = float(cl5.iloc[-1])
+                ret_parts = []
+                for y in [1, 2, 3]:
+                    lb = y * 252
+                    if len(cl5) > lb:
+                        ret = (cur / float(cl5.iloc[-lb]) - 1) * 100
+                        ret_parts.append(f"{y}年前比 {'▲' if ret>0 else '▼'}{abs(ret):.0f}%")
+                if ret_parts:
+                    elems.append(_p("【過去株価実績】　" + "　|　".join(ret_parts), s_body))
+        except Exception:
+            pass
+
+        # ── リスク要因 ──
+        elems += [
+            Spacer(1, 3*mm),
+            _p("【リスク要因・注意点】", _style(f"rr{rank}", fontName=_FONT_BOLD,
+               fontSize=10, textColor=C_RED, spaceAfter=2, leading=14)),
+        ]
+        for risk in risks:
+            elems.append(_p(f"⚠　{risk}", s_risk))
+
+        # ── 目標シナリオ ──
+        elems += [
+            Spacer(1, 3*mm),
+            _p("【投資シナリオ】", _style(f"rs{rank}", fontName=_FONT_BOLD,
+               fontSize=10, textColor=C_ORANGE, spaceAfter=2, leading=14)),
+            _p(scenario, s_scenario),
+            Spacer(1, 4*mm),
+            HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#aaaaaa"),
+                       spaceAfter=6),
+        ]
+
+        if rank < len(candidates):
+            elems.append(PageBreak())
+        time.sleep(0.2)
+
+    # 免責事項
+    elems += [
+        Spacer(1, 8*mm),
+        HRFlowable(width="100%", thickness=1, color=C_NAVY, spaceAfter=4),
+        _p("【免責事項】", _style("disc_h", fontName=_FONT_BOLD, fontSize=9,
+           textColor=C_NAVY, spaceAfter=2, leading=14)),
+        _p("本レポートは情報提供を目的とした自動生成レポートであり、投資勧誘を意図するものではありません。"
+           "投資判断は必ずご自身の責任において行ってください。株式投資にはリスクが伴い、元本の損失が生じる可能性があります。",
+           _style("disc", fontSize=8, leading=12, textColor=colors.HexColor("#666666"), spaceAfter=2)),
+    ]
+
+    doc.build(elems)
+    print(f"[保存] 推奨レポート: {path}")
 
 
-def save_analysis(results: list):
-    """注目銘柄（マッチ数>=2）の詳細分析テキストを出力"""
-    top = [r for r in results if r["マッチ戦略数"] >= 2]
-    if not top:
-        return
-
-    print(f"\n詳細分析生成中... ({len(top)}銘柄)")
-    path_ana = os.path.join(OUTPUT_DIR, "screening_analysis.txt")
-
-    with open(path_ana, "w", encoding="utf-8") as f:
-        f.write("=" * 68 + "\n")
-        f.write(f" 注目銘柄 詳細分析レポート ({TODAY})\n")
-        f.write(f" 対象: マッチ戦略数 >= 2  ({len(top)}銘柄)\n")
-        f.write(f" 内容: 四季報情報 / 財務指標 / 5年株価動向 / 直近ニュース\n")
-        f.write("=" * 68 + "\n")
-
-        for i, r in enumerate(top, 1):
-            ticker = r["銘柄コード"]
-            market = r["市場"]
-            print(f"  [{i}/{len(top)}] {ticker} 分析中...")
-            info     = fetch_info(ticker)
-            analysis = generate_stock_analysis(ticker, info, market)
-            f.write(analysis + "\n")
-            time.sleep(0.3)
-
-    print(f"[保存] 詳細分析:   {path_ana}")
-
-
+# ─────────────────────────────────────────
+# メイン
+# ─────────────────────────────────────────
 if __name__ == "__main__":
-    results = run_all_screens()
-    save_results(results)
-    save_analysis(results)
+    results_all, stock_data_raw = run_all_screens()
+
+    jp_n = sum(1 for r in results_all if r["市場"] == "JP")
+    us_n = len(results_all) - jp_n
+    print(f"\nヒット: {len(results_all)}銘柄  (JP:{jp_n} / US:{us_n})")
+    for r in results_all[:5]:
+        print(f"  {r['市場']} {r['銘柄コード']:8s}  スコア:{r['グロース評価スコア']:5.1f}"
+              f"  売上成長:{r.get('売上成長(%)',0):5.0f}%  {r['マッチ戦略'][:60]}")
+
+    save_analysis_pdf(results_all, stock_data_raw)
+    save_recommendation_pdf(results_all, stock_data_raw)
