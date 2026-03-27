@@ -2022,17 +2022,24 @@ def save_report_pdf(results: list, stock_data: dict):
     doc.build(elems)
     print(f"[保存] 統合レポート: {path}")
 
+    # results フォルダを最新5件に制限（古いものから削除）
+    _results_root = os.path.dirname(OUTPUT_DIR)
+    _runs = sorted(
+        [d for d in os.listdir(_results_root)
+         if os.path.isdir(os.path.join(_results_root, d))],
+    )  # フォルダ名が YYYY-MM-DD_HHMM 形式なので辞書順 = 時系列順
+    for _old in _runs[:-5]:
+        _old_path = os.path.join(_results_root, _old)
+        shutil.rmtree(_old_path, ignore_errors=True)
+        print(f"[削除] 古いresult: {_old_path}")
+
 
 # ─────────────────────────────────────────
 # メイン
 # ─────────────────────────────────────────
 if __name__ == "__main__":
-    # 既存のresultsをすべて削除してクリーンスタート
     _results_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
-    if os.path.exists(_results_root):
-        shutil.rmtree(_results_root)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print("既存のresultsフォルダを削除しました。")
 
     results_all, stock_data_raw = run_all_screens()
 
