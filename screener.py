@@ -16,6 +16,17 @@ import time
 import os
 from datetime import datetime
 
+# ── チャート生成 ───────────────────────────
+import matplotlib
+matplotlib.use("Agg")              # ヘッドレス環境
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.ticker as mticker
+from matplotlib.font_manager import FontProperties, fontManager
+
+# ── 翻訳 ──────────────────────────────────
+from deep_translator import GoogleTranslator
+
 # ── PDF 生成 ──────────────────────────────
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -39,8 +50,11 @@ _FONT_BOLD   = "HeiseiKakuGo-W5"
 _using_ttf   = False
 
 _reg_normal, _reg_bold = None, None
+_FONT_PATH = None  # matplotlib用TTFパス
 for _path, _reg, _ in _FONT_CANDIDATES:
     if os.path.exists(_path):
+        if _FONT_PATH is None:
+            _FONT_PATH = _path
         try:
             pdfmetrics.registerFont(TTFont(_reg, _path))
             if _reg_normal is None:
@@ -54,7 +68,6 @@ if _reg_normal:
     _FONT_NORMAL = _reg_normal
     _FONT_BOLD   = _reg_bold or _reg_normal
     _using_ttf   = True
-    # フォントファミリー登録（ps2tt対応）
     pdfmetrics.registerFontFamily(_reg_normal,
                                   normal=_reg_normal,
                                   bold=_FONT_BOLD,
@@ -62,6 +75,21 @@ if _reg_normal:
                                   boldItalic=_FONT_BOLD)
 else:
     pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
+
+# matplotlib 日本語フォント設定
+_MPL_FP = None
+if _FONT_PATH:
+    try:
+        fontManager.addfont(_FONT_PATH)
+        _MPL_FP = FontProperties(fname=_FONT_PATH)
+        _mpl_name = _MPL_FP.get_name()
+        matplotlib.rcParams.update({
+            "font.family": "sans-serif",
+            "font.sans-serif": [_mpl_name, "DejaVu Sans"],
+            "axes.unicode_minus": False,
+        })
+    except Exception:
+        _MPL_FP = None
 
 # カラーパレット
 C_NAVY   = colors.HexColor("#1a3a5c")
@@ -1054,6 +1082,265 @@ def run_all_screens():
 # ─────────────────────────────────────────
 # PDF出力①: 分析レポート
 # ─────────────────────────────────────────
+# ─────────────────────────────────────────
+# 翻訳ユーティリティ
+# ─────────────────────────────────────────
+_trans_cache: dict = {}
+
+def _translate(text: str, max_len: int = 400) -> str:
+    """英語→日本語翻訳（キャッシュ付き。失敗時は原文返却）"""
+    if not text or not text.strip():
+        return ""
+    text = text[:max_len]
+    if text in _trans_cache:
+        return _trans_cache[text]
+    try:
+        result = GoogleTranslator(source="auto", target="ja").translate(text)
+        _trans_cache[text] = result or text
+    except Exception:
+        _trans_cache[text] = text
+    return _trans_cache[text]
+
+
+# ─────────────────────────────────────────
+# CSV保存
+# ─────────────────────────────────────────
+def save_csv(results: list):
+    """スクリーニング結果をCSV保存"""
+    if not results:
+        return
+
+    rows = [{
+        "市場":           r["市場"],
+        "銘柄コード":     r["銘柄コード"],
+        "銘柄名":         r.get("銘柄名", ""),
+        "グロース評価スコア": r["グロース評価スコア"],
+        "現在値":         r["現在値"],
+        "RSI14":          r.get("RSI14", ""),
+        "売上成長(%)":    r.get("売上成長(%)", ""),
+        "粗利率(%)":      r.get("粗利率(%)", ""),
+        "ROE(%)":         r.get("ROE(%)", ""),
+        "PER":            r.get("PER", ""),
+        "PBR":            r.get("PBR", ""),
+        "マッチ戦略数":   r["マッチ戦略数"],
+        "マッチ戦略":     r["マッチ戦略"],
+        "ハイリスク":     r.get("ハイリスク", False),
+    } for r in results]
+
+    pd.DataFrame(rows).to_csv(
+        os.path.join(OUTPUT_DIR, "screening_all.csv"),
+        index=False, encoding="utf-8-sig")
+
+    # 戦略別サマリー
+    strat_rows = []
+    for sname in STRATEGIES:
+        hits = [r for r in results if sname in r["マッチ戦略"]]
+        jp_s = [r["銘柄コード"] for r in hits if r["市場"] == "JP"]
+        us_s = [r["銘柄コード"] for r in hits if r["市場"] == "US"]
+        strat_rows.append({
+            "戦略": sname,
+            "国内ヒット数": len(jp_s),
+            "米国ヒット数": len(us_s),
+            "合計": len(hits),
+            "国内銘柄": "、".join(jp_s),
+            "米国銘柄": "、".join(us_s),
+        })
+    pd.DataFrame(strat_rows).to_csv(
+        os.path.join(OUTPUT_DIR, "screening_summary.csv"),
+        index=False, encoding="utf-8-sig")
+
+    print(f"[保存] CSV: {OUTPUT_DIR}")
+
+
+# ─────────────────────────────────────────
+# チャート生成（変動要因アノテーション付き）
+# ─────────────────────────────────────────
+_CIRCLED = ["①","②","③","④","⑤","⑥","⑦","⑧"]
+
+
+def _move_desc(date, pct: float, news_list: list) -> str:
+    """変動日前後のニュースから要因説明を生成（日本語）"""
+    direction = "急騰" if pct > 0 else "急落"
+
+    # 前後7日以内のニュースを検索
+    target_ts = pd.Timestamp(date).timestamp()
+    nearby = []
+    for n in news_list:
+        pub_ts = n.get("providerPublishTime") or 0
+        title  = (n.get("title") or
+                  (n.get("content") or {}).get("title") or "")
+        if title and abs(pub_ts - target_ts) <= 7 * 86400:
+            nearby.append(title[:80])
+
+    if nearby:
+        # ニュースを翻訳して使用
+        return f"{direction} {pct:+.1f}%  ／  {_translate(nearby[0], 80)}"
+
+    # ニュースなし → テクニカル的な説明
+    strength = "大幅" if abs(pct) >= 20 else ("急" if abs(pct) >= 15 else "")
+    if pct > 0:
+        return f"{strength}上昇 {pct:+.1f}%  ／  上昇モメンタム加速（ニュース不明）"
+    else:
+        return f"{strength}下落 {pct:+.1f}%  ／  売り圧力強まる（ニュース不明）"
+
+
+def generate_chart_with_annotations(
+        ticker: str, market: str,
+        df_raw: pd.DataFrame, output_dir: str
+) -> tuple:
+    """
+    変動要因番号アノテーション付き株価チャートを生成。
+    Returns: (png_path: str | None, annotations: list[dict])
+    """
+    if df_raw is None or len(df_raw) < 30:
+        return None, []
+
+    try:
+        df = df_raw.copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+
+        close  = df["Close"].squeeze().dropna()
+        volume = df["Volume"].squeeze().fillna(0)
+
+        p = MARKET_PARAMS.get(market, MARKET_PARAMS["US"])
+
+        def sma(n):
+            return close.rolling(n).mean()
+
+        sma_s = sma(int(p["sma_s"].replace("SMA", "")))
+        sma_m = sma(int(p["sma_m"].replace("SMA", "")))
+        sma_l = sma(200)
+
+        # ── 主要変動を週次リターンから抽出 ──
+        weekly = close.resample("W-FRI").last().dropna()
+        wret   = weekly.pct_change().dropna()
+        sig_w  = wret[wret.abs() >= 0.08]
+        if len(sig_w) > 8:
+            sig_w = sig_w.loc[sig_w.abs().nlargest(8).index].sort_index()
+
+        # ニュース取得
+        try:
+            news_list = yf.Ticker(ticker).news or []
+        except Exception:
+            news_list = []
+
+        sig_moves = []
+        for w_date, w_pct in sig_w.items():
+            idx = close.index.get_indexer([w_date], method="nearest")[0]
+            d_date  = close.index[idx]
+            d_price = float(close.iloc[idx])
+            desc    = _move_desc(d_date, w_pct * 100, news_list)
+            sig_moves.append({
+                "num":      len(sig_moves) + 1,
+                "date":     d_date,
+                "date_str": d_date.strftime("%Y/%m/%d"),
+                "price":    d_price,
+                "pct":      w_pct * 100,
+                "desc":     desc,
+            })
+
+        # ── チャート描画 ──
+        fig, (ax1, ax2) = plt.subplots(
+            2, 1, figsize=(10, 6.5),
+            gridspec_kw={"height_ratios": [3, 1]},
+            sharex=True)
+        fig.patch.set_facecolor("white")
+
+        kw_fp = {"fontproperties": _MPL_FP} if _MPL_FP else {}
+
+        ax1.plot(close.index, close.values,
+                 color="#1a3a5c", linewidth=1.4, label="終値", zorder=3)
+        ax1.plot(sma_s.index, sma_s.values,
+                 color="#2563a8", linewidth=0.9, linestyle="--",
+                 alpha=0.85, label=p["sma_s"])
+        ax1.plot(sma_m.index, sma_m.values,
+                 color="#f57c00", linewidth=0.9, linestyle="--",
+                 alpha=0.85, label=p["sma_m"])
+        ax1.plot(sma_l.index, sma_l.values,
+                 color="#dc2626", linewidth=0.9, linestyle="--",
+                 alpha=0.85, label="SMA200")
+
+        # アノテーション（番号付き丸）
+        y_min = float(close.min())
+        y_max = float(close.max())
+        y_rng = max(y_max - y_min, y_max * 0.01)
+        for i, m in enumerate(sig_moves):
+            fc = "#15803d" if m["pct"] > 0 else "#dc2626"
+            offset = y_rng * (0.14 if i % 2 == 0 else -0.14)
+            ann_y  = np.clip(m["price"] + offset, y_min - y_rng * 0.05,
+                             y_max + y_rng * 0.05)
+            lbl = _CIRCLED[i] if i < len(_CIRCLED) else str(m["num"])
+            ax1.annotate(
+                lbl,
+                xy=(m["date"], m["price"]),
+                xytext=(m["date"], ann_y),
+                fontsize=9, color="white",
+                ha="center", va="center", zorder=5,
+                bbox=dict(boxstyle="circle,pad=0.22",
+                          fc=fc, ec="white", lw=0.5),
+                arrowprops=dict(arrowstyle="-",
+                                color=fc, lw=0.7),
+                **kw_fp,
+            )
+
+        ax1.set_ylabel("株価", fontsize=9, **kw_fp)
+        ax1.legend(loc="upper left", fontsize=7, ncol=4,
+                   prop=_MPL_FP if _MPL_FP else None)
+        currency_unit = "（円）" if market == "JP" else "（USD）"
+        ax1.yaxis.set_major_formatter(
+            mticker.FuncFormatter(
+                lambda x, _: (f"{x/10000:.1f}万" if x >= 10000 else f"{x:,.0f}")
+                if market == "JP" else f"{x:,.1f}"
+            ))
+        ax1.grid(True, alpha=0.3, linewidth=0.5)
+        ax1.set_facecolor("#f8f9fa")
+
+        # タイトル（番号の凡例を添える）
+        title_base = f"{ticker}  株価チャート（過去2年）  {currency_unit}"
+        ax1.set_title(title_base, fontsize=10, fontweight="bold",
+                      color="#1a3a5c", pad=6, **kw_fp)
+
+        # 出来高
+        c_vol = ["#15803d" if (i == 0 or close.iloc[i] >= close.iloc[i-1])
+                 else "#dc2626"
+                 for i in range(len(close))]
+        ax2.bar(volume.index, volume.values,
+                color=c_vol, alpha=0.65, width=1)
+        ax2.set_ylabel("出来高", fontsize=9, **kw_fp)
+        ax2.yaxis.set_major_formatter(
+            mticker.FuncFormatter(
+                lambda x, _: (f"{x/1e4:.0f}万" if x >= 1e4 else f"{x:.0f}")
+                if market == "JP"
+                else (f"{x/1e6:.0f}M" if x >= 1e6 else f"{x/1e3:.0f}K")
+            ))
+        ax2.grid(True, alpha=0.3, linewidth=0.5, axis="y")
+        ax2.set_facecolor("#f8f9fa")
+
+        ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter("%y/%m"))
+        plt.setp(ax2.get_xticklabels(), rotation=30, ha="right", fontsize=8)
+
+        plt.tight_layout(pad=1.0)
+
+        # 保存
+        safe_ticker = ticker.replace(".", "_")
+        png_path = os.path.join(output_dir, f"chart_{safe_ticker}.png")
+        fig.savefig(png_path, dpi=160, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+
+        return png_path, sig_moves
+
+    except Exception as e:
+        print(f"  [チャート生成エラー] {ticker}: {e}")
+        return None, []
+
+
+# ─────────────────────────────────────────
+# PDF出力①: 分析レポート
+# ─────────────────────────────────────────
 def save_analysis_pdf(results: list, stock_data: dict):
     """スクリーニング全体の分析レポートPDF"""
     if not results:
@@ -1196,86 +1483,106 @@ def save_analysis_pdf(results: list, stock_data: dict):
             Spacer(1, 1*mm),
         ]
 
-        # 事業概要（英語原文）
+        # 事業概要（日本語翻訳）
         if desc_en:
+            desc_ja = _translate(desc_en, 280)
+            if len(info.get("longBusinessSummary","")) > 280:
+                desc_ja += "…"
             elems += [
-                _p("◆ 事業概要（英語）", _style(f"a_dh{i}", fontName=_FONT_BOLD,
-                   fontSize=8, leading=12, textColor=C_BLUE, spaceAfter=1)),
-                _p(desc_en + ("…" if len(info.get("longBusinessSummary","")) > 280 else ""),
-                   s_en),
+                _p("◆ 事業概要", _style(f"a_dh{i}", fontName=_FONT_BOLD,
+                   fontSize=8.5, leading=12, textColor=C_BLUE, spaceAfter=1)),
+                _p(desc_ja, s_small),
                 Spacer(1, 1*mm),
             ]
 
-        # 財務指標テーブル（2列×6行）
+        # 財務指標テーブル（2列×5行）
         fin_data = [
             ["財務指標", "数値", "財務指標", "数値"],
-            ["時価総額",   mktcap_s,
+            ["時価総額", mktcap_s,
              "売上成長率（前年比）", f"{rev_v:.1f}%"],
             ["株価収益率（PER）", f"{per_v:.1f}倍" if per_v else "N/A",
-             "粗利率",     f"{gross_v:.1f}%"],
+             "粗利率", f"{gross_v:.1f}%"],
             ["株価純資産倍率（PBR）", f"{pbr_v:.2f}倍" if pbr_v else "N/A",
              "営業利益率", f"{op_v:.1f}%"],
             ["自己資本利益率（ROE）", f"{roe_v:.1f}%",
-             "総資産利益率（ROA）",  f"{roa_v:.1f}%"],
+             "総資産利益率（ROA）", f"{roa_v:.1f}%"],
             ["配当利回り", f"{div_v:.2f}%",
-             "負債資本比率（D/E）",  f"{de_v:.1f}" if de_v else "N/A"],
+             "負債資本比率（D/E）", f"{de_v:.1f}" if de_v else "N/A"],
         ]
-        # 列幅: 50+35+50+45=180mm
         elems.append(_tbl(fin_data, [50*mm, 35*mm, 50*mm, 45*mm]))
         elems.append(Spacer(1, 2*mm))
 
-        # 株価動向テーブル（5年）
-        try:
-            df5 = yf.download(ticker, period="5y", progress=False, auto_adjust=True)
-            if df5 is not None and len(df5) >= 30:
-                df5.columns = [c[0] if isinstance(c, tuple) else c for c in df5.columns]
-                cl5 = df5["Close"].squeeze()
-                cur = float(cl5.iloc[-1])
-                h52 = float(cl5.rolling(252).max().iloc[-1])
-                l52 = float(cl5.rolling(252).min().iloc[-1])
+        # ── チャート（変動要因アノテーション付き）──
+        raw_df  = stock_data.get(ticker)
+        png_path, sig_moves = generate_chart_with_annotations(
+            ticker, market, raw_df, OUTPUT_DIR)
 
-                ret_lines = []
-                for y in [1, 2, 3]:
-                    lb = y * 252
-                    if len(cl5) > lb:
-                        ret = (cur / float(cl5.iloc[-lb]) - 1) * 100
-                        ret_lines.append(
-                            f"{y}年前比: {'▲' if ret>0 else '▼'}{abs(ret):.0f}%")
+        if png_path and os.path.exists(png_path):
+            from reportlab.platypus import Image as RLImage
+            img_h = 88 * mm
+            elems += [
+                _p("◆ 株価チャート（過去2年）と主要変動",
+                   _style(f"a_ch{i}", fontName=_FONT_BOLD, fontSize=8.5,
+                          leading=12, textColor=C_BLUE, spaceAfter=2)),
+                RLImage(png_path, width=178*mm, height=img_h),
+                Spacer(1, 1*mm),
+            ]
+            if sig_moves:
+                ann_data = [["番号", "日付", "変動率", "変動要因分析"]]
+                for m in sig_moves:
+                    lbl = _CIRCLED[m["num"]-1] if m["num"] <= len(_CIRCLED) else str(m["num"])
+                    ann_data.append([
+                        lbl, m["date_str"],
+                        f"{m['pct']:+.1f}%",
+                        m["desc"],
+                    ])
+                elems.append(_tbl(ann_data,
+                                  [10*mm, 22*mm, 18*mm, 130*mm]))
+        else:
+            # チャートなし → 従来のテキスト株価動向
+            try:
+                df5 = yf.download(ticker, period="5y", progress=False, auto_adjust=True)
+                if df5 is not None and len(df5) >= 30:
+                    df5.columns = [c[0] if isinstance(c, tuple) else c for c in df5.columns]
+                    cl5 = df5["Close"].squeeze()
+                    cur = float(cl5.iloc[-1])
+                    h52 = float(cl5.rolling(252).max().iloc[-1])
+                    l52 = float(cl5.rolling(252).min().iloc[-1])
+                    ret_lines = []
+                    for y in [1, 2, 3]:
+                        lb = y * 252
+                        if len(cl5) > lb:
+                            ret = (cur / float(cl5.iloc[-lb]) - 1) * 100
+                            ret_lines.append(
+                                f"{y}年前比: {'▲' if ret>0 else '▼'}{abs(ret):.0f}%")
+                    price_data = [
+                        ["株価動向（過去5年）", ""],
+                        ["52週高値", f"{h52:.1f}{currency}　（現在比 {(cur/h52-1)*100:+.0f}%）"],
+                        ["52週安値", f"{l52:.1f}{currency}　（現在比 {(cur/l52-1)*100:+.0f}%）"],
+                        ["年次リターン", "　　".join(ret_lines) or "データ不足"],
+                    ]
+                    elems.append(_tbl(price_data, [50*mm, 130*mm],
+                                      extra_styles=[("SPAN",(0,0),(-1,0)),
+                                                    ("BACKGROUND",(0,0),(-1,0),C_LBLUE)],
+                                      subhdr_rows=[(0, C_LBLUE)]))
+            except Exception:
+                pass
 
-                price_data = [
-                    ["株価動向（過去5年）", ""],
-                    ["52週高値",
-                     f"{h52:.1f}{currency}　（現在比 {(cur/h52-1)*100:+.0f}%）"],
-                    ["52週安値",
-                     f"{l52:.1f}{currency}　（現在比 {(cur/l52-1)*100:+.0f}%）"],
-                    ["年次リターン",
-                     "　　".join(ret_lines) or "データ不足"],
-                ]
-                # 行0をサブヘッダーとして処理
-                elems.append(_tbl(price_data, [50*mm, 130*mm],
-                                  extra_styles=[
-                                      ("SPAN",       (0,0), (-1,0)),
-                                      ("BACKGROUND", (0,0), (-1,0), C_LBLUE),
-                                  ],
-                                  subhdr_rows=[(0, C_LBLUE)]))
-                elems.append(Spacer(1, 2*mm))
-        except Exception:
-            pass
+        elems.append(Spacer(1, 2*mm))
 
-        # 直近ニュース
+        # 直近ニュース（日本語翻訳）
         try:
             news_list   = yf.Ticker(ticker).news or []
             news_shown  = []
             for n in news_list[:15]:
                 title  = n.get("title") or (n.get("content") or {}).get("title", "")
                 pub_ts = n.get("providerPublishTime") or 0
-                pub_dt = (datetime.fromtimestamp(pub_ts).strftime("%Y/%m/%d")
-                          if pub_ts else "－")
+                pub_dt = datetime.fromtimestamp(pub_ts).strftime("%Y/%m/%d") if pub_ts else "－"
                 if title:
-                    news_shown.append([pub_dt, title[:72]])
+                    news_shown.append([pub_dt, _translate(title, 100)])
                 if len(news_shown) >= 5: break
             if news_shown:
-                nd = [["直近ニュース（英語）"]] + \
+                nd = [["直近ニュース"]] + \
                      [[f"[{d}]　{t}"] for d, t in news_shown]
                 elems.append(_tbl(nd, [180*mm],
                                   subhdr_rows=[(0, C_LBLUE)],
@@ -1447,30 +1754,54 @@ def save_recommendation_pdf(results: list, stock_data: dict):
              f"{gross_v:.0f}%",
              f"{op_v:.0f}%"],
         ]
-        # 列幅: 25+28+28+28+22+22+27=180mm
         elems.append(_tbl(fin_data,
                           [25*mm, 28*mm, 28*mm, 28*mm, 22*mm, 22*mm, 27*mm]))
         elems.append(Spacer(1, 3*mm))
 
-        # ── 過去株価実績 ──
-        try:
-            df5 = yf.download(ticker, period="5y", progress=False, auto_adjust=True)
-            if df5 is not None and len(df5) >= 60:
-                df5.columns = [c[0] if isinstance(c, tuple) else c for c in df5.columns]
-                cl5 = df5["Close"].squeeze()
-                cur = float(cl5.iloc[-1])
-                ret_parts = []
-                for y in [1, 2, 3]:
-                    lb = y * 252
-                    if len(cl5) > lb:
-                        ret = (cur / float(cl5.iloc[-lb]) - 1) * 100
-                        ret_parts.append(
-                            f"{y}年前比　{'▲' if ret>0 else '▼'}{abs(ret):.0f}%")
-                if ret_parts:
-                    elems.append(_p(
-                        "【過去株価実績】　" + "　　".join(ret_parts), s_body))
-        except Exception:
-            pass
+        # ── チャート（変動要因アノテーション付き）──
+        rec_raw_df = stock_data.get(ticker)
+        png_path_r, sig_moves_r = generate_chart_with_annotations(
+            ticker, market, rec_raw_df, OUTPUT_DIR)
+
+        if png_path_r and os.path.exists(png_path_r):
+            from reportlab.platypus import Image as RLImage
+            elems += [
+                _p("【株価チャートと主要変動】",
+                   _style(f"r_chh{rank}", fontName=_FONT_BOLD, fontSize=10,
+                          textColor=C_BLUE, spaceAfter=2, leading=14)),
+                RLImage(png_path_r, width=178*mm, height=86*mm),
+                Spacer(1, 1*mm),
+            ]
+            if sig_moves_r:
+                ann_data_r = [["番号", "日付", "変動率", "変動要因分析"]]
+                for m in sig_moves_r:
+                    lbl = _CIRCLED[m["num"]-1] if m["num"] <= len(_CIRCLED) else str(m["num"])
+                    ann_data_r.append([
+                        lbl, m["date_str"],
+                        f"{m['pct']:+.1f}%",
+                        m["desc"],
+                    ])
+                elems.append(_tbl(ann_data_r, [10*mm, 22*mm, 18*mm, 130*mm]))
+        else:
+            # フォールバック: テキストで過去リターン表示
+            try:
+                df5 = yf.download(ticker, period="5y", progress=False, auto_adjust=True)
+                if df5 is not None and len(df5) >= 60:
+                    df5.columns = [c[0] if isinstance(c, tuple) else c for c in df5.columns]
+                    cl5 = df5["Close"].squeeze()
+                    cur = float(cl5.iloc[-1])
+                    ret_parts = []
+                    for y in [1, 2, 3]:
+                        lb = y * 252
+                        if len(cl5) > lb:
+                            ret = (cur / float(cl5.iloc[-lb]) - 1) * 100
+                            ret_parts.append(
+                                f"{y}年前比　{'▲' if ret>0 else '▼'}{abs(ret):.0f}%")
+                    if ret_parts:
+                        elems.append(_p(
+                            "【過去株価実績】　" + "　　".join(ret_parts), s_body))
+            except Exception:
+                pass
 
         # ── リスク要因 ──
         elems += [
@@ -1529,5 +1860,6 @@ if __name__ == "__main__":
         print(f"  {r['市場']} {r['銘柄コード']:8s}  スコア:{r['グロース評価スコア']:5.1f}"
               f"  売上成長:{r.get('売上成長(%)',0):5.0f}%  {r['マッチ戦略'][:60]}")
 
+    save_csv(results_all)
     save_analysis_pdf(results_all, stock_data_raw)
     save_recommendation_pdf(results_all, stock_data_raw)
