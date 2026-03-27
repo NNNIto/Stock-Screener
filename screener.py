@@ -1776,7 +1776,7 @@ def save_report_pdf(results: list, stock_data: dict):
                 Spacer(1, 1*mm),
             ]
             if sig_moves:
-                ann_data = [["番号", "日付", "変動率", "変動要因詳細分析"]]
+                ann_data = [["番号", "日付", "変動率", "変動要因"]]
                 for m in sig_moves:
                     lbl = _CIRCLED[m["num"]-1] if m["num"] <= len(_CIRCLED) else str(m["num"])
                     ann_data.append([lbl, m["date_str"], f"{m['pct']:+.1f}%", m["desc"]])
@@ -1969,7 +1969,7 @@ def save_report_pdf(results: list, stock_data: dict):
                 Spacer(1, 1*mm),
             ]
             if sig_moves2:
-                ann_data2 = [["番号", "日付", "変動率", "変動要因詳細分析"]]
+                ann_data2 = [["番号", "日付", "変動率", "変動要因"]]
                 for m in sig_moves2:
                     lbl = _CIRCLED[m["num"]-1] if m["num"] <= len(_CIRCLED) else str(m["num"])
                     ann_data2.append([lbl, m["date_str"], f"{m['pct']:+.1f}%", m["desc"]])
