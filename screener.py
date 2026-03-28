@@ -2434,3 +2434,22 @@ if __name__ == "__main__":
 
     save_csv(results_all)
     save_report_pdf(results_all, stock_data_raw)
+
+    # ── 実行後 Git コミット & プッシュ ──────────────────
+    _repo = os.path.dirname(os.path.abspath(__file__))
+    _dt   = datetime.today().strftime("%Y-%m-%d %H:%M")
+    try:
+        import subprocess as _sp
+        # 直近5件の results フォルダをステージング（削除済み含む）
+        _sp.run(["git", "-C", _repo, "add", "screener.py", "results/"],
+                check=True)
+        _sp.run(["git", "-C", _repo, "add", "-u"],
+                check=True)
+        _sp.run(["git", "-C", _repo, "commit", "-m",
+                 f"スクリーニング結果: {_dt}"],
+                check=True)
+        _sp.run(["git", "-C", _repo, "push", "origin", "main"],
+                check=True)
+        print(f"[Git] プッシュ完了: スクリーニング結果: {_dt}")
+    except Exception as _ge:
+        print(f"[Git] プッシュ失敗（手動対応してください）: {_ge}")
