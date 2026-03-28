@@ -1123,11 +1123,12 @@ def _build_move_blocks(sig_moves):
     Flowableリストを返す。sig_moves の各要素に "analysis" dict が必要。
     """
     _cat_rows = [
-        ("①マクロ（市場全体）",   "macro"),
-        ("②セクター（業界）",     "sector"),
-        ("③個別企業（ファンダ）", "company"),
-        ("④需給（資金の流れ）",   "demand"),
-        ("⑤テクニカル",           "technical"),
+        ("マクロ（市場全体）",       "macro"),
+        ("セクター（業界）",         "sector"),
+        ("個別企業（ファンダメンタル）", "company"),
+        ("需給（資金の流れ）",       "demand"),
+        ("テクニカル",               "technical"),
+        ("半年後の収益見込み",       "outlook"),
     ]
     elems = []
     for m in sig_moves:
@@ -1333,20 +1334,22 @@ def _gpt_move_analysis(ctx: dict) -> "dict | None":
         "必ず指定のJSON形式のみで返してください。説明文・前置き・コードブロックは不要です。\n\n"
         "出力JSON形式:\n"
         "{\n"
-        '  "macro": "①マクロ（市場全体）の要因。マクロ経済・金融政策・地政学リスク・市場全体の動向を記載",\n'
-        '  "sector": "②セクター（業界）の要因。業界トレンド・セクターETF動向・業界特有のイベントを記載",\n'
-        '  "company": "③個別企業（ファンダメンタル）の要因。決算・業績・製品・経営イベントを記載",\n'
-        '  "demand": "④需給（資金の流れ）の要因。出来高・機関投資家動向・52週高安値・リスクオン/オフを記載",\n'
-        '  "technical": "⑤テクニカルの要因。RSI・ボリンジャーバンド・MACD・SMA乖離・チャートパターンを記載",\n'
-        '  "summary": "最も株価に影響を与えた主要因をカテゴリ名（①〜⑤）付きで1〜2文でまとめる",\n'
+        '  "macro": "マクロ（市場全体）の要因。マクロ経済・金融政策・地政学リスク・市場全体の動向を記載",\n'
+        '  "sector": "セクター（業界）の要因。業界トレンド・セクターETF動向・業界特有のイベントを記載",\n'
+        '  "company": "個別企業（ファンダメンタル）の要因。決算・業績・製品・経営イベントを記載",\n'
+        '  "demand": "需給（資金の流れ）の要因。出来高・機関投資家動向・52週高安値・リスクオン/オフを記載",\n'
+        '  "technical": "テクニカルの要因。RSI・ボリンジャーバンド・MACD・SMA乖離・チャートパターンを記載",\n'
+        '  "outlook": "半年後の収益見込み。売上・利益成長の方向性・リスク・上値/下値メドを簡潔に記載",\n'
+        '  "summary": "最も株価に影響を与えた主要因をカテゴリ名付きで1〜2文でまとめる",\n'
         '  "short_term": "短期要因（数日〜数週間）：ニュース反応・決算・テクニカル過熱など",\n'
         '  "mid_term": "中長期要因（数ヶ月〜）：マクロ政策・業界構造変化・トレンド転換など"\n'
         "}\n\n"
         "【要件】\n"
         "・各カテゴリに具体的な数値・イベント名を含めること\n"
-        "・複数要因が重なる場合は優先度を示すこと（例：主因は③、副因は①）\n"
+        "・複数要因が重なる場合は優先度を示すこと（例：主因はセクター、副因はマクロ）\n"
         "・推測は「〜とみられる」と明記し、事実と区別すること\n"
-        "・各カテゴリ50〜120文字程度を目安に簡潔かつ情報密度高く記載すること"
+        "・各カテゴリ50〜120文字程度を目安に簡潔かつ情報密度高く記載すること\n"
+        "・半年後の収益見込みは、当時の業績トレンド・市場環境・セクター動向を踏まえて記載すること"
     )
 
     data = ctx.copy()
@@ -1391,13 +1394,13 @@ def _gpt_move_analysis(ctx: dict) -> "dict | None":
             ],
             response_format={"type": "json_object"},
             temperature=0.3,
-            max_tokens=800,
+            max_tokens=1000,
             timeout=20,
         )
         raw = resp.choices[0].message.content or "{}"
         result = json.loads(raw)
         # 必須キーの存在確認
-        required = {"macro", "sector", "company", "demand", "technical", "summary", "short_term", "mid_term"}
+        required = {"macro", "sector", "company", "demand", "technical", "outlook", "summary", "short_term", "mid_term"}
         if not required.issubset(result.keys()):
             return None
         _GPT_CACHE[cache_key] = result
@@ -1653,7 +1656,7 @@ def _detailed_move_analysis(date, pct: float, df_ind: pd.DataFrame,
 
     # ─── 主要因の優先度判定（複数要因が重なる場合） ────────
     if earnings_tag:
-        priority_cat    = "③個別企業（ファンダメンタル）"
+        priority_cat    = "個別企業（ファンダメンタル）"
         summary = f"{priority_cat}が主因：決算{earnings_tag}への反応"
         if news_title:
             summary += f"　関連ニュース：{news_title[:30]}"
@@ -1668,23 +1671,23 @@ def _detailed_move_analysis(date, pct: float, df_ind: pd.DataFrame,
         priority_cat = "③個別企業（ファンダメンタル）"
         summary = f"{priority_cat}が主因：{news_title[:40]}"
     elif mkt_alpha is not None and abs(mkt_alpha) >= 4:
-        priority_cat = "②セクター（業界）"
+        priority_cat = "セクター（業界）"
         ind  = "アウトパフォーム" if mkt_alpha > 0 else "アンダーパフォーム"
         summary = f"{priority_cat}が主因：セクターETFが市場比α {mkt_alpha:+.1f}%で{ind}"
     elif bm_pct is not None and abs(bm_pct) >= 3.5 and (sec_alpha is None or abs(sec_alpha) < 5):
-        priority_cat = "①マクロ（市場全体）"
+        priority_cat = "マクロ（市場全体）"
         side = "上昇" if bm_pct > 0 else "下落"
         summary = f"{priority_cat}が主因：市場全体の{side}に連動（指数 {bm_pct:+.1f}%）"
         if macro_event:
             summary += f"　背景：{macro_event[:30]}"
     elif macro_event and not earnings_tag and not news_title:
-        priority_cat = "①マクロ（市場全体）"
+        priority_cat = "マクロ（市場全体）"
         summary = f"{priority_cat}が主因：{macro_event[:40]}"
     elif vol_ratio >= 2.5:
-        priority_cat = "④需給（資金の流れ）"
+        priority_cat = "需給（資金の流れ）"
         summary = f"{priority_cat}が主因：出来高 {vol_ratio:.1f}倍急増による需給インパクト"
     else:
-        priority_cat = "⑤テクニカル"
+        priority_cat = "テクニカル"
         summary = f"{priority_cat}が主因：明確なファンダ材料なし、テクニカル主導の値動き"
 
     # ─── 短期 / 中長期要因の区別 ───────────────────────
@@ -1710,12 +1713,29 @@ def _detailed_move_analysis(date, pct: float, df_ind: pd.DataFrame,
     short_str = "　".join(short_factors) if short_factors else "特定の短期要因なし"
     mid_str   = "　".join(mid_factors)   if mid_factors   else "特定の中長期要因なし"
 
+    # ── 半年後の収益見込み（ローカルロジック簡易推定） ──
+    outlook_parts = []
+    if macro_event:
+        outlook_parts.append(f"マクロ環境（{macro_event[:20]}）の影響が継続する見込み")
+    if mkt_alpha is not None and abs(mkt_alpha) >= 2:
+        ind = "追い風" if mkt_alpha > 0 else "向かい風"
+        outlook_parts.append(f"セクタートレンドは{ind}（ETF市場比α {mkt_alpha:+.1f}%）")
+    if not np.isnan(dev200) and dev200 > 15:
+        outlook_parts.append(f"SMA200を{dev200:.0f}%上回る強いトレンド継続中")
+    elif not np.isnan(dev200) and dev200 < -15:
+        outlook_parts.append(f"SMA200を{abs(dev200):.0f}%下回り回復には時間を要する見込み")
+    if not outlook_parts:
+        direction = "緩やかな上昇" if pct > 0 else "横ばい〜回復"
+        outlook_parts.append(f"現状トレンドが継続すれば{direction}が見込まれる")
+    outlook_str = "　".join(outlook_parts)
+
     return {
         "macro":      macro_str,
         "sector":     sector_str,
         "company":    company_str,
         "demand":     demand_str,
         "technical":  tech_str,
+        "outlook":    outlook_str,
         "summary":    summary,
         "short_term": short_str,
         "mid_term":   mid_str,
