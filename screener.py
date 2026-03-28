@@ -15,8 +15,32 @@ import numpy as np
 import time
 import os
 import io
+import json
 import shutil
 from datetime import datetime
+
+# ── .env 読み込み ──────────────────────────
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and "=" in _line and not _line.startswith("#"):
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
+# ── OpenAI ────────────────────────────────
+_OPENAI_CLIENT = None
+try:
+    import openai as _openai_mod
+    _oai_key = os.environ.get("OPENAI_API_KEY", "")
+    if _oai_key:
+        _OPENAI_CLIENT = _openai_mod.OpenAI(api_key=_oai_key)
+        print("[GPT] OpenAI クライアント初期化完了")
+except Exception as _e:
+    print(f"[GPT] OpenAI 初期化スキップ: {_e}")
+
+_GPT_CACHE: dict = {}   # キャッシュ（同一データの重複呼び出し防止）
 
 # ── チャート生成 ───────────────────────────
 import matplotlib
@@ -1029,8 +1053,12 @@ _cs_hdr   = ParagraphStyle("_csh",  fontName=_FONT_BOLD,   fontSize=8.5,
                              leading=12, textColor=C_WHITE,  wordWrap="CJK")
 _cs_body  = ParagraphStyle("_csb",  fontName=_FONT_NORMAL, fontSize=8.5,
                              leading=12, textColor=C_BLACK,  wordWrap="CJK")
-_cs_lblue = ParagraphStyle("_cslb", fontName=_FONT_BOLD,   fontSize=8.5,
-                             leading=12, textColor=C_NAVY,   wordWrap="CJK")
+_cs_lblue   = ParagraphStyle("_cslb",  fontName=_FONT_BOLD,   fontSize=8.5,
+                               leading=12, textColor=C_NAVY,   wordWrap="CJK")
+_cs_cat_lbl = ParagraphStyle("_cscat", fontName=_FONT_BOLD,   fontSize=8,
+                               leading=11, textColor=C_NAVY,   wordWrap="CJK")
+_cs_sum_lbl = ParagraphStyle("_cssum", fontName=_FONT_BOLD,   fontSize=8.5,
+                               leading=12, textColor=C_NAVY,   wordWrap="CJK")
 
 
 def _style(name, **kw):
@@ -1087,6 +1115,69 @@ def _tbl(data, col_widths, extra_styles=None, hdr_bg=C_NAVY, subhdr_rows=None):
         base += extra_styles
     t.setStyle(TableStyle(base))
     return t
+
+
+def _build_move_blocks(sig_moves):
+    """
+    各変動アノテーションを5カテゴリ構造ブロック（Tableベース）として描画する
+    Flowableリストを返す。sig_moves の各要素に "analysis" dict が必要。
+    """
+    _cat_rows = [
+        ("①マクロ（市場全体）",   "macro"),
+        ("②セクター（業界）",     "sector"),
+        ("③個別企業（ファンダ）", "company"),
+        ("④需給（資金の流れ）",   "demand"),
+        ("⑤テクニカル",           "technical"),
+    ]
+    elems = []
+    for m in sig_moves:
+        lbl      = _CIRCLED[m["num"] - 1] if m["num"] <= len(_CIRCLED) else str(m["num"])
+        pct_str  = f"{m['pct']:+.1f}%"
+        analysis = m.get("analysis", {})
+
+        hdr_text = f"{lbl}　{m['date_str']}　変動率{pct_str}　主要変動要因分析（5カテゴリ）"
+        rows = [[Paragraph(_safe(hdr_text), _cs_hdr), ""]]  # SPANされるヘッダー
+
+        for cat_label, key in _cat_rows:
+            val = analysis.get(key) or "－"
+            rows.append([
+                Paragraph(_safe(cat_label), _cs_cat_lbl),
+                Paragraph(_safe(val),       _cs_body),
+            ])
+
+        short_t = analysis.get("short_term", "")
+        mid_t   = analysis.get("mid_term",   "")
+        if short_t and short_t != "特定の短期要因なし":
+            rows.append([Paragraph("【短期要因】",  _cs_cat_lbl),
+                         Paragraph(_safe(short_t), _cs_body)])
+        if mid_t and mid_t != "特定の中長期要因なし":
+            rows.append([Paragraph("【中長期要因】", _cs_cat_lbl),
+                         Paragraph(_safe(mid_t),    _cs_body)])
+
+        summary = analysis.get("summary", "")
+        if summary:
+            rows.append([Paragraph("■主要因まとめ",  _cs_sum_lbl),
+                         Paragraph(_safe(summary),   _cs_sum_lbl)])
+
+        n_rows  = len(rows)
+        sum_row = n_rows - 1
+
+        t = Table(rows, colWidths=[40 * mm, 138 * mm])
+        t.setStyle(TableStyle([
+            ("SPAN",           (0, 0),        (-1, 0),        ),
+            ("BACKGROUND",     (0, 0),        (-1, 0),        C_NAVY),
+            ("BACKGROUND",     (0, sum_row),  (-1, sum_row),  C_LBLUE),
+            ("ROWBACKGROUNDS", (0, 1),        (-1, sum_row - 1), [C_WHITE, C_LGRAY]),
+            ("GRID",           (0, 0),        (-1, -1),       0.4, colors.HexColor("#cccccc")),
+            ("VALIGN",         (0, 0),        (-1, -1),       "TOP"),
+            ("TOPPADDING",     (0, 0),        (-1, -1),       4),
+            ("BOTTOMPADDING",  (0, 0),        (-1, -1),       4),
+            ("LEFTPADDING",    (0, 0),        (-1, -1),       5),
+            ("RIGHTPADDING",   (0, 0),        (-1, -1),       5),
+        ]))
+        elems.append(t)
+        elems.append(Spacer(1, 2 * mm))
+    return elems
 
 
 # ─────────────────────────────────────────
@@ -1224,36 +1315,166 @@ def save_csv(results: list):
 _CIRCLED = ["①","②","③","④","⑤","⑥","⑦","⑧"]
 
 
-def _detailed_move_desc(date, pct: float, df_ind: pd.DataFrame,
-                         news_list: list, earnings_set: set,
-                         market: str = "US",
-                         benchmark_wret: "pd.Series | None" = None,
-                         sector_wret:    "pd.Series | None" = None) -> str:
+def _gpt_move_analysis(ctx: dict) -> "dict | None":
     """
-    主要変動の詳細要因分析テキストを生成（6観点）。
-    ① 決算発表前後  ② ニュース翻訳
-    ③ 市場・セクター・個別の3段階分解（ベンチマーク＋セクターETF）
-    ④ マクロ・社会情勢イベント  ⑤ 決算シーズン推論
-    ⑥ テクニカル背景（出来高・52週高安値ブレイク・RSI・BB・MACD・SMA200乖離）
+    収集済みコンテキストをGPTに渡して5カテゴリ分析dictを生成する。
+    失敗時は None を返す（呼び出し元がローカルロジックにフォールバック）。
     """
-    ts     = pd.Timestamp(date)
-    yr_mo  = ts.strftime("%Y-%m")
-    month  = ts.month
-    parts  = []   # 主要要因（ファンダ・マクロ・需給系）
-    ctx    = []   # テクニカル背景（補足情報）
+    if _OPENAI_CLIENT is None:
+        return None
 
-    # ─── ① 決算発表との前後関係 ──────────────────────
+    cache_key = (ctx.get("date_str"), ctx.get("pct"), ctx.get("ticker", ""))
+    if cache_key in _GPT_CACHE:
+        return _GPT_CACHE[cache_key]
+
+    system_prompt = (
+        "あなたは機関投資家向け株式市場の専門アナリストです。\n"
+        "与えられた株価変動データを基に、以下の5カテゴリで変動要因を日本語で分析し、"
+        "必ず指定のJSON形式のみで返してください。説明文・前置き・コードブロックは不要です。\n\n"
+        "出力JSON形式:\n"
+        "{\n"
+        '  "macro": "①マクロ（市場全体）の要因。マクロ経済・金融政策・地政学リスク・市場全体の動向を記載",\n'
+        '  "sector": "②セクター（業界）の要因。業界トレンド・セクターETF動向・業界特有のイベントを記載",\n'
+        '  "company": "③個別企業（ファンダメンタル）の要因。決算・業績・製品・経営イベントを記載",\n'
+        '  "demand": "④需給（資金の流れ）の要因。出来高・機関投資家動向・52週高安値・リスクオン/オフを記載",\n'
+        '  "technical": "⑤テクニカルの要因。RSI・ボリンジャーバンド・MACD・SMA乖離・チャートパターンを記載",\n'
+        '  "summary": "最も株価に影響を与えた主要因をカテゴリ名（①〜⑤）付きで1〜2文でまとめる",\n'
+        '  "short_term": "短期要因（数日〜数週間）：ニュース反応・決算・テクニカル過熱など",\n'
+        '  "mid_term": "中長期要因（数ヶ月〜）：マクロ政策・業界構造変化・トレンド転換など"\n'
+        "}\n\n"
+        "【要件】\n"
+        "・各カテゴリに具体的な数値・イベント名を含めること\n"
+        "・複数要因が重なる場合は優先度を示すこと（例：主因は③、副因は①）\n"
+        "・推測は「〜とみられる」と明記し、事実と区別すること\n"
+        "・各カテゴリ50〜120文字程度を目安に簡潔かつ情報密度高く記載すること"
+    )
+
+    data = ctx.copy()
+    data.pop("df_ind", None)   # DataFrameは渡さない
+    user_prompt = (
+        f"以下のデータを分析してください。\n\n"
+        f"【基本情報】\n"
+        f"- 銘柄: {data.get('ticker','不明')}  市場: {data.get('market','不明')}\n"
+        f"- 変動日: {data.get('date_str','不明')}  週次変動率: {data.get('pct',0):+.1f}%\n\n"
+        f"【市場・セクターデータ】\n"
+        f"- ベンチマーク（{'SPY' if data.get('market')=='US' else '日経225'}）週次: "
+        f"{data.get('bm_pct','N/A'):+.1f}%\n"
+        f"- セクターETF週次: {data.get('sec_pct','N/A')}"
+        + (f"{data.get('sec_pct',0):+.1f}%" if isinstance(data.get('sec_pct'), float) else "N/A")
+        + f"\n"
+        f"- 市場比セクターα: "
+        + (f"{data.get('mkt_alpha',0):+.1f}%" if isinstance(data.get('mkt_alpha'), float) else "N/A")
+        + f"\n"
+        f"- セクター比個別α: "
+        + (f"{data.get('sec_alpha',0):+.1f}%" if isinstance(data.get('sec_alpha'), float) else "N/A")
+        + f"\n\n"
+        f"【個別企業データ】\n"
+        f"- 決算日との関係: {data.get('earnings_tag') or 'なし'}\n"
+        f"- 近傍ニュース: {data.get('news_title') or 'なし'}\n\n"
+        f"【マクロ・市場環境】\n"
+        f"- 当月マクロイベント: {data.get('macro_event') or 'なし'}\n\n"
+        f"【テクニカル指標】\n"
+        f"- RSI14: {data.get('rsi','N/A')}\n"
+        f"- SMA200乖離: {data.get('dev200','N/A')}\n"
+        f"- ボリンジャーバンド: 上限={data.get('bb_u','N/A')}, 終値={data.get('close_v','N/A')}, 下限={data.get('bb_l','N/A')}\n"
+        f"- MACDヒストグラム: {data.get('macd_h','N/A')}\n"
+        f"- 出来高/20日平均: {data.get('vol_ratio',0):.1f}倍\n"
+        f"- 52週高値: {data.get('h52','N/A')}, 52週安値: {data.get('l52','N/A')}, 終値: {data.get('close_v','N/A')}\n"
+    )
+
+    try:
+        resp = _OPENAI_CLIENT.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.3,
+            max_tokens=800,
+            timeout=20,
+        )
+        raw = resp.choices[0].message.content or "{}"
+        result = json.loads(raw)
+        # 必須キーの存在確認
+        required = {"macro", "sector", "company", "demand", "technical", "summary", "short_term", "mid_term"}
+        if not required.issubset(result.keys()):
+            return None
+        _GPT_CACHE[cache_key] = result
+        return result
+    except Exception as _e:
+        print(f"  [GPT] エラー: {_e}")
+        return None
+
+
+def _detailed_move_analysis(date, pct: float, df_ind: pd.DataFrame,
+                             news_list: list, earnings_set: set,
+                             market: str = "US",
+                             benchmark_wret: "pd.Series | None" = None,
+                             sector_wret:    "pd.Series | None" = None,
+                             ticker: str = "") -> dict:
+    """
+    主要変動を5カテゴリで構造化分析したdictを返す。
+    keys: macro, sector, company, demand, technical, summary, short_term, mid_term
+    """
+    ts    = pd.Timestamp(date)
+    yr_mo = ts.strftime("%Y-%m")
+    month = ts.month
+
+    # ── ベンチマーク・セクターETFのリターン取得 ──
+    bm_pct  = None
+    sec_pct = None
+    if benchmark_wret is not None and len(benchmark_wret) > 0:
+        try:
+            bi = benchmark_wret.index.get_indexer([ts], method="nearest")[0]
+            bm_pct = float(benchmark_wret.iloc[bi]) * 100
+        except Exception:
+            pass
+    if sector_wret is not None and len(sector_wret) > 0:
+        try:
+            si = sector_wret.index.get_indexer([ts], method="nearest")[0]
+            sec_pct = float(sector_wret.iloc[si]) * 100
+        except Exception:
+            pass
+
+    mkt_alpha = (sec_pct - bm_pct) if (bm_pct is not None and sec_pct is not None) else None
+    sec_alpha = (pct - sec_pct)     if sec_pct is not None else (
+                (pct - bm_pct)      if bm_pct is not None else None)
+
+    # ── テクニカル指標の取得 ──
+    tech = {}
+    try:
+        idx = df_ind.index.get_indexer([date], method="nearest")[0]
+        row = df_ind.iloc[idx]
+        tech["close"]  = float(row.get("Close")     or 0)
+        tech["h52"]    = float(row.get("HIGH_52W")  or np.nan)
+        tech["l52"]    = float(row.get("LOW_52W")   or np.nan)
+        tech["vol"]    = float(row.get("Volume")    or 0)
+        tech["vol_ma"] = float(row.get("VOL_MA20")  or 0)
+        tech["rsi"]    = float(row.get("RSI14")     or np.nan)
+        tech["dev200"] = float(row.get("DEV_SMA200") or np.nan)
+        tech["bb_u"]   = float(row.get("BB_upper")  or 0)
+        tech["bb_l"]   = float(row.get("BB_lower")  or 0)
+        tech["macd_h"] = float(row.get("MACD_hist") or np.nan)
+    except Exception:
+        pass
+
+    vol_ratio = (tech.get("vol", 0) / tech["vol_ma"]
+                 if tech.get("vol_ma", 0) > 0 else 0)
+    close_v = tech.get("close", 0)
+
+    # ── 決算日前後チェック ──
+    earnings_tag = None
     move_date = ts.normalize()
     for d in range(-3, 8):
         chk = move_date + pd.Timedelta(days=d)
         if chk in earnings_set:
-            tag = ("発表3日前" if d == -3 else "発表2日前" if d == -2 else
-                   "発表前日"  if d == -1 else "発表当日"  if d == 0 else
-                   f"発表後{d}日")
-            parts.append(f"決算{tag}の変動")
+            earnings_tag = ("発表3日前" if d == -3 else "発表2日前" if d == -2 else
+                            "発表前日"  if d == -1 else "発表当日"  if d == 0 else
+                            f"発表後{d}日")
             break
 
-    # ─── ② 近傍ニュース（±7日以内・最近傍優先） ─────────
+    # ── 近傍ニュース取得（±7日以内） ──
     target_ts = ts.timestamp()
     near_news = sorted(
         [(abs(n.get("providerPublishTime", 0) - target_ts),
@@ -1262,167 +1483,243 @@ def _detailed_move_desc(date, pct: float, df_ind: pd.DataFrame,
          if abs(n.get("providerPublishTime", 0) - target_ts) <= 7 * 86400
          and (n.get("title") or (n.get("content") or {}).get("title") or "")]
     )
-    if near_news:
-        _, best_title = near_news[0]
-        parts.append(_translate(best_title, 90))
+    news_title = _translate(near_news[0][1], 90) if near_news else None
 
-    # ─── ③ 市場・セクター・個別の3段階分解 ──────────────
-    bm_pct  = None
-    sec_pct = None
-
-    if benchmark_wret is not None and len(benchmark_wret) > 0:
-        try:
-            bi = benchmark_wret.index.get_indexer([ts], method="nearest")[0]
-            bm_pct = float(benchmark_wret.iloc[bi]) * 100
-        except Exception:
-            pass
-
-    if sector_wret is not None and len(sector_wret) > 0:
-        try:
-            si = sector_wret.index.get_indexer([ts], method="nearest")[0]
-            sec_pct = float(sector_wret.iloc[si]) * 100
-        except Exception:
-            pass
-
-    if bm_pct is not None and sec_pct is not None:
-        # 3段階分解: 市場要因 / セクター要因 / 個別要因
-        mkt_alpha = sec_pct - bm_pct   # セクターが市場をどれだけ超過したか
-        sec_alpha = pct     - sec_pct  # 個別株がセクターをどれだけ超過したか
-        if abs(bm_pct) >= 3 and abs(mkt_alpha) < 3 and abs(sec_alpha) < 5:
-            side = "上昇" if bm_pct > 0 else "下落"
-            ctx.append(f"市場主導の{side}（指数{bm_pct:+.1f}% / "
-                       f"セクター{sec_pct:+.1f}% / 個別α{sec_alpha:+.1f}%）")
-        elif abs(sec_pct) >= 3 and abs(mkt_alpha) >= 2 and abs(sec_alpha) < 5:
-            side = "上昇" if sec_pct > 0 else "下落"
-            ctx.append(f"セクター主導の{side}（セクターETF{sec_pct:+.1f}% / "
-                       f"市場比+{mkt_alpha:+.1f}% / 個別α{sec_alpha:+.1f}%）")
-        elif abs(sec_alpha) >= 5:
-            side = "アウトパフォーム" if sec_alpha > 0 else "アンダーパフォーム"
-            ctx.append(f"個別株要因が主体（セクターETF{sec_pct:+.1f}%に対し"
-                       f"α{sec_alpha:+.1f}%の{side}）")
-    elif bm_pct is not None:
-        # ベンチマークのみ（JP等セクターETFなし）
-        alpha = pct - bm_pct
-        if abs(bm_pct) >= 3.5 and pct * bm_pct > 0:
-            side = "上昇" if bm_pct > 0 else "下落"
-            ctx.append(f"市場全体も{side}に連動（指数{bm_pct:+.1f}% / "
-                       f"個別超過α{alpha:+.1f}%）")
-        elif abs(bm_pct) >= 3.5 and pct * bm_pct < 0:
-            ctx.append(f"市場（指数{bm_pct:+.1f}%）に逆行した個別株要因")
-        elif abs(alpha) >= 7 and abs(bm_pct) < 3:
-            ctx.append(f"市場安定の中での強い個別株要因（市場比α{alpha:+.1f}%）")
-
-    # ─── ④ マクロ・社会情勢イベント（月次辞書）─────────
     macro_event = _MACRO_EVENTS.get(yr_mo)
-    if macro_event and not parts:
-        parts.append(f"マクロ要因: {macro_event}")
 
-    # ─── ⑤ 決算シーズン推論 ───────────────────────────
-    if not parts:
+    # ── GPT分析を優先試行（失敗時はローカルロジックにフォールバック） ──
+    _gpt_ctx = {
+        "ticker":       ticker,
+        "date_str":     ts.strftime("%Y/%m/%d"),
+        "market":       market,
+        "pct":          pct,
+        "bm_pct":       bm_pct,
+        "sec_pct":      sec_pct,
+        "mkt_alpha":    mkt_alpha,
+        "sec_alpha":    sec_alpha,
+        "earnings_tag": earnings_tag,
+        "news_title":   news_title,
+        "macro_event":  macro_event,
+        "rsi":          tech.get("rsi"),
+        "dev200":       tech.get("dev200"),
+        "bb_u":         tech.get("bb_u"),
+        "bb_l":         tech.get("bb_l"),
+        "close_v":      close_v,
+        "macd_h":       tech.get("macd_h"),
+        "vol_ratio":    vol_ratio,
+        "h52":          tech.get("h52"),
+        "l52":          tech.get("l52"),
+    }
+    _gpt_result = _gpt_move_analysis(_gpt_ctx)
+    if _gpt_result is not None:
+        return _gpt_result
+
+    # ─── ① マクロ（市場全体） ───────────────────────────
+    macro_parts = []
+    if macro_event:
+        macro_parts.append(macro_event)
+    if bm_pct is not None:
+        bm_sym = "SPY（S&P500）" if market == "US" else "日経225"
+        if abs(bm_pct) >= 3.5:
+            side = "大幅上昇" if bm_pct > 0 else "大幅下落"
+            macro_parts.append(f"市場全体も{side}（{bm_sym} {bm_pct:+.1f}%）")
+        elif abs(bm_pct) >= 1.5:
+            side = "上昇" if bm_pct > 0 else "下落"
+            macro_parts.append(f"市場は{side}基調（{bm_sym} {bm_pct:+.1f}%）")
+        else:
+            macro_parts.append(f"市場はほぼ横ばい（{bm_sym} {bm_pct:+.1f}%）")
+    if not macro_event:
         if market == "JP":
             season = _JP_EARNINGS_SEASON.get(month)
             if season:
-                direction = "上方修正・好決算への期待" if pct > 0 else "下方修正・業績悪化懸念"
-                parts.append(f"{season}における{direction}とみられる")
+                macro_parts.append(f"時期：{season}")
         else:
             season = _US_EARNINGS_SEASON.get(month)
             if season:
-                direction = "好決算・ガイダンス上方修正への反応" if pct > 0 else "業績失望・見通し引き下げへの反応"
-                parts.append(f"{season}における{direction}とみられる")
+                macro_parts.append(f"時期：{season}")
+    macro_str = "　".join(macro_parts) if macro_parts else "特定のマクロイベントなし"
 
-    # ─── ⑥ テクニカル背景（常に収集） ──────────────────
-    try:
-        idx     = df_ind.index.get_indexer([date], method="nearest")[0]
-        row     = df_ind.iloc[idx]
-        close_v = float(row.get("Close") or 0)
+    # ─── ② セクター（業界） ─────────────────────────────
+    sector_parts = []
+    if sec_pct is not None and bm_pct is not None:
+        sector_parts.append(f"セクターETF {sec_pct:+.1f}%（市場比α {mkt_alpha:+.1f}%）")
+        if abs(mkt_alpha) >= 4:
+            ind = "大幅アウトパフォーム" if mkt_alpha > 0 else "大幅アンダーパフォーム"
+            sector_parts.append(f"セクター全体が市場を{ind}")
+        elif abs(mkt_alpha) >= 2:
+            ind = "アウトパフォーム" if mkt_alpha > 0 else "アンダーパフォーム"
+            sector_parts.append(f"セクターが市場を{ind}")
+    elif sec_pct is not None:
+        sector_parts.append(f"セクターETF {sec_pct:+.1f}%")
+    if market == "JP":
+        season = _JP_EARNINGS_SEASON.get(month)
+        if season:
+            sector_parts.append(f"時期：{season}")
+    else:
+        season = _US_EARNINGS_SEASON.get(month)
+        if season:
+            sector_parts.append(f"時期：{season}")
+    sector_str = "　".join(sector_parts) if sector_parts else "セクターETFデータなし（JP市場または取得不可）"
 
-        # 52週高値・安値ブレイクアウト
-        h52 = float(row.get("HIGH_52W") or np.nan)
-        l52 = float(row.get("LOW_52W")  or np.nan)
-        if close_v > 0 and not np.isnan(h52) and h52 > 0:
-            if close_v >= h52:
-                ctx.append("52週高値を更新（新高値ブレイクアウト・買いモメンタム加速）")
-            elif close_v >= h52 * 0.97:
-                ctx.append(f"52週高値（{h52:.1f}）に迫る高値圏での攻防")
-        if close_v > 0 and not np.isnan(l52) and l52 > 0:
-            if close_v <= l52:
-                ctx.append("52週安値を更新（下値サポート喪失・売り継続リスク）")
-            elif close_v <= l52 * 1.05:
-                ctx.append(f"52週安値（{l52:.1f}）付近での底値圏攻防")
+    # ─── ③ 個別企業（ファンダメンタル） ─────────────────
+    company_parts = []
+    if earnings_tag:
+        direction = "上方修正・好決算への期待／反応" if pct > 0 else "下方修正・業績悪化への懸念／反応"
+        company_parts.append(f"決算{earnings_tag}：{direction}")
+    if news_title:
+        company_parts.append(f"直近ニュース：{news_title}")
+    if sec_alpha is not None and abs(sec_alpha) >= 5:
+        base_label = "セクター対比" if sec_pct is not None else "市場対比"
+        ind = "アウトパフォーム" if sec_alpha > 0 else "アンダーパフォーム"
+        company_parts.append(f"{base_label}個別α {sec_alpha:+.1f}%（強い個別株{ind}）")
+    company_str = "　".join(company_parts) if company_parts else "特定の個別企業材料なし（セクター・市場連動とみられる）"
 
-        # 出来高比
-        vol_now = float(row.get("Volume")   or 0)
-        vol_ma  = float(row.get("VOL_MA20") or 0)
-        if vol_ma > 0 and vol_now > 0:
-            ratio = vol_now / vol_ma
-            if ratio >= 3.0:
-                ctx.append(f"出来高が20日平均比{ratio:.1f}倍に急増（機関投資家の大口売買）")
-            elif ratio >= 1.8:
-                ctx.append(f"出来高増加（平均比{ratio:.1f}倍）")
-            elif ratio <= 0.5:
-                ctx.append("出来高閑散（流動性薄く値動きが誇張された可能性）")
+    # ─── ④ 需給（資金の流れ） ────────────────────────────
+    demand_parts = []
+    if vol_ratio >= 3.0:
+        demand_parts.append(f"出来高20日平均比{vol_ratio:.1f}倍に急増（機関投資家の大口売買を示唆）")
+    elif vol_ratio >= 1.8:
+        demand_parts.append(f"出来高増加（平均比{vol_ratio:.1f}倍）")
+    elif 0 < vol_ratio <= 0.5:
+        demand_parts.append("出来高閑散（流動性薄く値動きが誇張された可能性）")
 
-        # RSI
-        rsi = float(row.get("RSI14") or np.nan)
-        if not np.isnan(rsi):
-            if rsi >= 80:
-                ctx.append(f"RSI {rsi:.0f}（極端な過熱・短期過買われ）")
-            elif rsi >= 70:
-                ctx.append(f"RSI {rsi:.0f}（過買われ域・利食い圧力）")
-            elif rsi <= 22:
-                ctx.append(f"RSI {rsi:.0f}（極端な売られ過ぎ・自律反発の可能性）")
-            elif rsi <= 32:
-                ctx.append(f"RSI {rsi:.0f}（売られ過ぎ・底打ち模索）")
+    h52 = tech.get("h52", np.nan)
+    l52 = tech.get("l52", np.nan)
+    if close_v > 0 and not np.isnan(h52) and h52 > 0:
+        if close_v >= h52:
+            demand_parts.append("52週高値を更新（新高値ブレイクアウト・買いモメンタム加速）")
+        elif close_v >= h52 * 0.97:
+            demand_parts.append(f"52週高値（{h52:.1f}）付近での高値圏攻防")
+    if close_v > 0 and not np.isnan(l52) and l52 > 0:
+        if close_v <= l52:
+            demand_parts.append("52週安値を更新（下値サポート喪失・売り継続リスク）")
+        elif close_v <= l52 * 1.05:
+            demand_parts.append(f"52週安値（{l52:.1f}）付近での底値圏攻防")
 
-        # SMA200乖離
-        dev200 = float(row.get("DEV_SMA200") or np.nan)
-        if not np.isnan(dev200):
-            if abs(dev200) >= 40:
-                side = "上方" if dev200 > 0 else "下方"
-                ctx.append(f"SMA200から{abs(dev200):.0f}%{side}乖離（過熱圏/叩き売り圏）")
-            elif abs(dev200) >= 15:
-                side = "上" if dev200 > 0 else "下"
-                ctx.append(f"SMA200から{abs(dev200):.0f}%乖離（{side}方向）")
+    if bm_pct is not None and abs(bm_pct) >= 3:
+        flow = "リスクオン（市場全体への資金流入局面）" if bm_pct > 0 else "リスクオフ（市場全体からの資金流出局面）"
+        demand_parts.append(flow)
 
-        # ボリンジャーバンド突破
-        bb_u = float(row.get("BB_upper") or 0)
-        bb_l = float(row.get("BB_lower") or 0)
-        if close_v > 0 and bb_u > 0:
-            if close_v > bb_u:
-                ctx.append("ボリンジャーバンド+2σ突破（強いブレイクアウト）")
-            elif bb_l > 0 and close_v < bb_l:
-                ctx.append("ボリンジャーバンド-2σ割れ（強い売りシグナル）")
+    if not demand_parts:
+        direction = "買い需要が優勢" if pct > 0 else "売り圧力が優勢"
+        demand_parts.append(f"特段の需給異常なし（{direction}）")
+    demand_str = "　".join(demand_parts)
 
-        # MACD
-        macd_h = float(row.get("MACD_hist") or np.nan)
-        if not np.isnan(macd_h):
-            if macd_h > 0 and pct > 0:
-                ctx.append("MACDヒストグラム拡大（上昇モメンタム加速）")
-            elif macd_h < 0 and pct < 0:
-                ctx.append("MACDヒストグラム縮小（下落モメンタム継続）")
-
-    except Exception:
-        pass
-
-    # ─── 最終フォールバック ──────────────────────────
-    if not parts:
-        tech_lead = next((c for c in ctx if "出来高" in c), None)
-        if tech_lead:
-            ctx.remove(tech_lead)
-            direction = "急騰" if pct > 0 else "急落"
-            parts.append(f"{tech_lead}を伴う{direction}（需給主導とみられる）")
+    # ─── ⑤ テクニカル ─────────────────────────────────
+    tech_parts = []
+    rsi = tech.get("rsi", np.nan)
+    if not np.isnan(rsi):
+        if rsi >= 80:
+            tech_parts.append(f"RSI {rsi:.0f}（極端な過買われ・短期過熱）")
+        elif rsi >= 70:
+            tech_parts.append(f"RSI {rsi:.0f}（過買われ域・利食い圧力）")
+        elif rsi <= 22:
+            tech_parts.append(f"RSI {rsi:.0f}（極端な売られ過ぎ・自律反発の可能性）")
+        elif rsi <= 32:
+            tech_parts.append(f"RSI {rsi:.0f}（売られ過ぎ・底打ち模索）")
         else:
-            strength = "大幅な" if abs(pct) >= 20 else "急速な"
-            macro_hint = f"、{macro_event}" if macro_event else ""
-            if pct > 0:
-                parts.append(f"{strength}上昇（機関投資家の買い集め・テーマ株物色など需給要因{macro_hint}とみられる）")
-            else:
-                parts.append(f"{strength}下落（リスクオフ・利食い・ポジション調整など需給要因{macro_hint}とみられる）")
+            tech_parts.append(f"RSI {rsi:.0f}（中立域）")
 
-    main_text = "　".join(parts)
-    if ctx:
-        return f"{main_text}  ／  " + "、".join(ctx[:3])
-    return main_text
+    bb_u = tech.get("bb_u", 0)
+    bb_l = tech.get("bb_l", 0)
+    if close_v > 0 and bb_u > 0:
+        if close_v > bb_u:
+            tech_parts.append("ボリンジャーバンド+2σ突破（強いブレイクアウトシグナル）")
+        elif bb_l > 0 and close_v < bb_l:
+            tech_parts.append("ボリンジャーバンド-2σ割れ（強い売りシグナル）")
+
+    dev200 = tech.get("dev200", np.nan)
+    if not np.isnan(dev200):
+        if abs(dev200) >= 40:
+            side = "上方" if dev200 > 0 else "下方"
+            tech_parts.append(f"SMA200から{abs(dev200):.0f}%{side}乖離（過熱/叩き売り圏）")
+        elif abs(dev200) >= 15:
+            side = "上" if dev200 > 0 else "下"
+            tech_parts.append(f"SMA200から{abs(dev200):.0f}%乖離（{side}方向への強いトレンド）")
+        elif abs(dev200) <= 3:
+            tech_parts.append(f"SMA200付近（±{abs(dev200):.0f}%）での攻防")
+
+    macd_h = tech.get("macd_h", np.nan)
+    if not np.isnan(macd_h):
+        if macd_h > 0 and pct > 0:
+            tech_parts.append("MACDヒストグラム拡大（上昇モメンタム継続）")
+        elif macd_h < 0 and pct < 0:
+            tech_parts.append("MACDヒストグラム縮小（下落モメンタム継続）")
+        elif macd_h > 0 and pct < 0:
+            tech_parts.append("MACDはポジティブも株価は反落（上昇一服・反落局面）")
+        elif macd_h < 0 and pct > 0:
+            tech_parts.append("MACDはネガティブも株価は反発（自律反発・逆張り動意）")
+    tech_str = "　".join(tech_parts) if tech_parts else "特段のテクニカルシグナルなし"
+
+    # ─── 主要因の優先度判定（複数要因が重なる場合） ────────
+    if earnings_tag:
+        priority_cat    = "③個別企業（ファンダメンタル）"
+        summary = f"{priority_cat}が主因：決算{earnings_tag}への反応"
+        if news_title:
+            summary += f"　関連ニュース：{news_title[:30]}"
+    elif sec_alpha is not None and abs(sec_alpha) >= 7:
+        priority_cat = "③個別企業（ファンダメンタル）"
+        base = "セクター対比" if sec_pct is not None else "市場対比"
+        ind  = "アウトパフォーム" if sec_alpha > 0 else "アンダーパフォーム"
+        summary = f"{priority_cat}が主因：{base}α {sec_alpha:+.1f}%の強い個別動き"
+        if news_title:
+            summary += f"（{news_title[:30]}）"
+    elif news_title and (bm_pct is None or abs(pct - (bm_pct or 0)) >= 5):
+        priority_cat = "③個別企業（ファンダメンタル）"
+        summary = f"{priority_cat}が主因：{news_title[:40]}"
+    elif mkt_alpha is not None and abs(mkt_alpha) >= 4:
+        priority_cat = "②セクター（業界）"
+        ind  = "アウトパフォーム" if mkt_alpha > 0 else "アンダーパフォーム"
+        summary = f"{priority_cat}が主因：セクターETFが市場比α {mkt_alpha:+.1f}%で{ind}"
+    elif bm_pct is not None and abs(bm_pct) >= 3.5 and (sec_alpha is None or abs(sec_alpha) < 5):
+        priority_cat = "①マクロ（市場全体）"
+        side = "上昇" if bm_pct > 0 else "下落"
+        summary = f"{priority_cat}が主因：市場全体の{side}に連動（指数 {bm_pct:+.1f}%）"
+        if macro_event:
+            summary += f"　背景：{macro_event[:30]}"
+    elif macro_event and not earnings_tag and not news_title:
+        priority_cat = "①マクロ（市場全体）"
+        summary = f"{priority_cat}が主因：{macro_event[:40]}"
+    elif vol_ratio >= 2.5:
+        priority_cat = "④需給（資金の流れ）"
+        summary = f"{priority_cat}が主因：出来高 {vol_ratio:.1f}倍急増による需給インパクト"
+    else:
+        priority_cat = "⑤テクニカル"
+        summary = f"{priority_cat}が主因：明確なファンダ材料なし、テクニカル主導の値動き"
+
+    # ─── 短期 / 中長期要因の区別 ───────────────────────
+    short_factors = []
+    mid_factors   = []
+    if earnings_tag:
+        short_factors.append(f"決算{earnings_tag}への即時市場反応")
+    if news_title:
+        short_factors.append("直近ニュースへの短期的な反応")
+    if not np.isnan(rsi) and (rsi >= 70 or rsi <= 32):
+        short_factors.append("テクニカル過熱／過売りによる短期需給変動")
+    if vol_ratio >= 2.0:
+        short_factors.append(f"大口売買（出来高{vol_ratio:.1f}倍）による短期的な需給インパクト")
+
+    if macro_event:
+        mid_factors.append(f"マクロ政策・情勢の継続的影響（{macro_event[:25]}）")
+    if mkt_alpha is not None and abs(mkt_alpha) >= 2:
+        mid_factors.append("セクターローテーション・業界トレンドの変化")
+    if not np.isnan(dev200) and abs(dev200) >= 15:
+        side = "上昇" if dev200 > 0 else "下落"
+        mid_factors.append(f"SMA200との乖離が拡大（中長期的な{side}トレンドの継続）")
+
+    short_str = "　".join(short_factors) if short_factors else "特定の短期要因なし"
+    mid_str   = "　".join(mid_factors)   if mid_factors   else "特定の中長期要因なし"
+
+    return {
+        "macro":      macro_str,
+        "sector":     sector_str,
+        "company":    company_str,
+        "demand":     demand_str,
+        "technical":  tech_str,
+        "summary":    summary,
+        "short_term": short_str,
+        "mid_term":   mid_str,
+    }
 
 
 def generate_chart_with_annotations(
@@ -1476,16 +1773,17 @@ def generate_chart_with_annotations(
             idx = close.index.get_indexer([w_date], method="nearest")[0]
             d_date  = close.index[idx]
             d_price = float(close.iloc[idx])
-            desc    = _detailed_move_desc(d_date, w_pct * 100, df_ind, news_list,
-                                          earnings_set or set(), market,
-                                          benchmark_wret, sector_wret)
+            analysis = _detailed_move_analysis(d_date, w_pct * 100, df_ind, news_list,
+                                               earnings_set or set(), market,
+                                               benchmark_wret, sector_wret,
+                                               ticker=ticker)
             sig_moves.append({
                 "num":      len(sig_moves) + 1,
                 "date":     d_date,
                 "date_str": d_date.strftime("%Y/%m/%d"),
                 "price":    d_price,
                 "pct":      w_pct * 100,
-                "desc":     desc,
+                "analysis": analysis,
             })
 
         # ── チャート描画 ──
@@ -1852,11 +2150,7 @@ def save_report_pdf(results: list, stock_data: dict):
                 Spacer(1, 1*mm),
             ]
             if sig_moves:
-                ann_data = [["番号", "日付", "変動率", "変動要因"]]
-                for m in sig_moves:
-                    lbl = _CIRCLED[m["num"]-1] if m["num"] <= len(_CIRCLED) else str(m["num"])
-                    ann_data.append([lbl, m["date_str"], f"{m['pct']:+.1f}%", m["desc"]])
-                elems.append(_tbl(ann_data, [10*mm, 22*mm, 16*mm, 132*mm]))
+                elems += _build_move_blocks(sig_moves)
         elems.append(Spacer(1, 3*mm))
 
         # リスク要因
@@ -2047,11 +2341,7 @@ def save_report_pdf(results: list, stock_data: dict):
                 Spacer(1, 1*mm),
             ]
             if sig_moves2:
-                ann_data2 = [["番号", "日付", "変動率", "変動要因"]]
-                for m in sig_moves2:
-                    lbl = _CIRCLED[m["num"]-1] if m["num"] <= len(_CIRCLED) else str(m["num"])
-                    ann_data2.append([lbl, m["date_str"], f"{m['pct']:+.1f}%", m["desc"]])
-                elems.append(_tbl(ann_data2, [10*mm, 22*mm, 16*mm, 132*mm]))
+                elems += _build_move_blocks(sig_moves2)
             elems.append(Spacer(1, 2*mm))
 
         # 直近ニュース（翻訳）
