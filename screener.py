@@ -1129,11 +1129,7 @@ def _build_move_blocks(sig_moves):
         ("需給（資金の流れ）",          "demand"),
         ("テクニカル",                  "technical"),
     ]
-    _outlook_rows = [
-        ("収益見込み（3か月後）",  "outlook_3m"),
-        ("収益見込み（6か月後）",  "outlook_6m"),
-        ("収益見込み（1年後）",    "outlook_12m"),
-    ]
+    _C_LGREEN = colors.HexColor("#dcfce7")
     elems = []
     for m in sig_moves:
         lbl      = _CIRCLED[m["num"] - 1] if m["num"] <= len(_CIRCLED) else str(m["num"])
@@ -1150,23 +1146,11 @@ def _build_move_blocks(sig_moves):
                 Paragraph(_safe(val),       _cs_body),
             ])
 
-        short_t = analysis.get("short_term", "")
-        mid_t   = analysis.get("mid_term",   "")
-        if short_t and short_t != "特定の短期要因なし":
-            rows.append([Paragraph("【短期要因】",  _cs_cat_lbl),
-                         Paragraph(_safe(short_t), _cs_body)])
-        if mid_t and mid_t != "特定の中長期要因なし":
-            rows.append([Paragraph("【中長期要因】", _cs_cat_lbl),
-                         Paragraph(_safe(mid_t),    _cs_body)])
-
-        # 収益見込み3行（薄い緑背景で区別）
-        outlook_start = len(rows)
-        for outlook_label, okey in _outlook_rows:
-            oval = analysis.get(okey) or "－"
-            rows.append([
-                Paragraph(_safe(outlook_label), _cs_cat_lbl),
-                Paragraph(_safe(oval),          _cs_body),
-            ])
+        # 収益見込み1行（薄い緑背景）
+        outlook_row = len(rows)
+        oval = analysis.get("outlook") or "－"
+        rows.append([Paragraph("収益見込み", _cs_cat_lbl),
+                     Paragraph(_safe(oval),  _cs_body)])
 
         summary = analysis.get("summary", "")
         if summary:
@@ -1175,21 +1159,20 @@ def _build_move_blocks(sig_moves):
 
         n_rows  = len(rows)
         sum_row = n_rows - 1
-        _C_LGREEN = colors.HexColor("#dcfce7")
 
         t = Table(rows, colWidths=[40 * mm, 138 * mm])
         t.setStyle(TableStyle([
-            ("SPAN",           (0, 0),              (-1, 0),              ),
-            ("BACKGROUND",     (0, 0),              (-1, 0),              C_NAVY),
-            ("BACKGROUND",     (0, sum_row),        (-1, sum_row),        C_LBLUE),
-            ("BACKGROUND",     (0, outlook_start),  (-1, sum_row - 1),    _C_LGREEN),
-            ("ROWBACKGROUNDS", (0, 1),              (-1, outlook_start - 1), [C_WHITE, C_LGRAY]),
-            ("GRID",           (0, 0),              (-1, -1),             0.4, colors.HexColor("#cccccc")),
-            ("VALIGN",         (0, 0),              (-1, -1),             "TOP"),
-            ("TOPPADDING",     (0, 0),              (-1, -1),             4),
-            ("BOTTOMPADDING",  (0, 0),              (-1, -1),             4),
-            ("LEFTPADDING",    (0, 0),              (-1, -1),             5),
-            ("RIGHTPADDING",   (0, 0),              (-1, -1),             5),
+            ("SPAN",           (0, 0),           (-1, 0),           ),
+            ("BACKGROUND",     (0, 0),           (-1, 0),           C_NAVY),
+            ("BACKGROUND",     (0, sum_row),     (-1, sum_row),     C_LBLUE),
+            ("BACKGROUND",     (0, outlook_row), (-1, outlook_row), _C_LGREEN),
+            ("ROWBACKGROUNDS", (0, 1),           (-1, outlook_row - 1), [C_WHITE, C_LGRAY]),
+            ("GRID",           (0, 0),           (-1, -1),          0.4, colors.HexColor("#cccccc")),
+            ("VALIGN",         (0, 0),           (-1, -1),          "TOP"),
+            ("TOPPADDING",     (0, 0),           (-1, -1),          4),
+            ("BOTTOMPADDING",  (0, 0),           (-1, -1),          4),
+            ("LEFTPADDING",    (0, 0),           (-1, -1),          5),
+            ("RIGHTPADDING",   (0, 0),           (-1, -1),          5),
         ]))
         elems.append(t)
         elems.append(Spacer(1, 2 * mm))
@@ -1354,12 +1337,8 @@ def _gpt_move_analysis(ctx: dict) -> "dict | None":
         '  "company": "個別企業（ファンダメンタル）の要因。決算・業績・製品・経営イベントを記載",\n'
         '  "demand": "需給（資金の流れ）の要因。出来高・機関投資家動向・52週高安値・リスクオン/オフを記載",\n'
         '  "technical": "テクニカルの要因。RSI・ボリンジャーバンド・MACD・SMA乖離・チャートパターンを記載",\n'
-        '  "outlook_3m": "3か月後の収益見込み。直近の業績モメンタム・短期イベント（決算・製品発表等）を踏まえた株価騰落率の見通し（例：+10〜+15%見込み、理由：...）",\n'
-        '  "outlook_6m": "6か月後の収益見込み。中期的な業績成長・セクタートレンド・マクロ環境を踏まえた株価騰落率の見通し（例：+15〜+25%見込み、理由：...）",\n'
-        '  "outlook_12m": "1年後の収益見込み。年間業績予想・競合環境・長期トレンドを踏まえた株価騰落率の見通し（例：+20〜+35%見込み、理由：...）",\n'
-        '  "summary": "最も株価に影響を与えた主要因をカテゴリ名付きで1〜2文でまとめる",\n'
-        '  "short_term": "短期要因（数日〜数週間）：ニュース反応・決算・テクニカル過熱など",\n'
-        '  "mid_term": "中長期要因（数ヶ月〜）：マクロ政策・業界構造変化・トレンド転換など"\n'
+        '  "outlook": "収益見込み。業績トレンド・セクター動向・マクロ環境を踏まえた今後の株価方向性と騰落率レンジ（例：+15〜+25%見込み）を根拠とともに記載",\n'
+        '  "summary": "最も株価に影響を与えた主要因をカテゴリ名付きで1〜2文でまとめる"\n'
         "}\n\n"
         "【要件】\n"
         "・各カテゴリに具体的な数値・イベント名を含めること\n"
@@ -1417,7 +1396,7 @@ def _gpt_move_analysis(ctx: dict) -> "dict | None":
         raw = resp.choices[0].message.content or "{}"
         result = json.loads(raw)
         # 必須キーの存在確認
-        required = {"macro", "sector", "company", "demand", "technical", "outlook_3m", "outlook_6m", "outlook_12m", "summary", "short_term", "mid_term"}
+        required = {"macro", "sector", "company", "demand", "technical", "outlook", "summary"}
         if not required.issubset(result.keys()):
             return None
         _GPT_CACHE[cache_key] = result
@@ -1733,50 +1712,27 @@ def _detailed_move_analysis(date, pct: float, df_ind: pd.DataFrame,
     # ── 収益見込み（ローカルロジック簡易推定） ──
     _trend_up   = (not np.isnan(dev200) and dev200 > 10) or (pct > 0)
     _trend_down = (not np.isnan(dev200) and dev200 < -10) or (pct < 0)
-    _sec_tail   = (mkt_alpha is not None and mkt_alpha > 2)
-    _sec_head   = (mkt_alpha is not None and mkt_alpha < -2)
 
-    def _outlook_note(base_low, base_high, horizon):
-        sign = "+" if _trend_up and not _trend_down else ("－" if _trend_down else "±")
-        note = f"株価騰落率 {sign}{base_low}〜{sign}{base_high}%の見込み"
-        if macro_event:
-            note += f"（マクロ：{macro_event[:18]}）"
-        if horizon == "3m" and earnings_tag:
-            note += f"　決算{earnings_tag}の反応が継続か注視"
-        if horizon == "6m" and _sec_tail:
-            note += f"　セクター追い風（ETF市場比α {mkt_alpha:+.1f}%）が支援"
-        if horizon == "6m" and _sec_head:
-            note += f"　セクター向かい風（ETF市場比α {mkt_alpha:+.1f}%）がリスク"
-        if horizon == "12m" and not np.isnan(dev200):
-            side = "上方" if dev200 > 0 else "下方"
-            note += f"　SMA200 {side}乖離{abs(dev200):.0f}%からの中長期トレンドに注目"
-        return note
-
-    if _trend_up:
-        o3m  = _outlook_note(5,  12, "3m")
-        o6m  = _outlook_note(10, 20, "6m")
-        o12m = _outlook_note(15, 30, "12m")
+    if _trend_up and not _trend_down:
+        outlook_str = f"株価騰落率 +10〜+25%の見込み"
     elif _trend_down:
-        o3m  = _outlook_note(3,  10, "3m").replace("+", "－")
-        o6m  = _outlook_note(5,  15, "6m").replace("+", "－")
-        o12m = _outlook_note(8,  20, "12m").replace("+", "－")
+        outlook_str = f"株価騰落率 −5〜−15%のリスク"
     else:
-        o3m  = f"株価騰落率 ±3〜±8%の見込み（横ばい圏）"
-        o6m  = f"株価騰落率 ±5〜±12%の見込み（トレンド待ち）"
-        o12m = f"株価騰落率 ±8〜±18%の見込み（ファンダ次第）"
+        outlook_str = f"株価騰落率 ±5〜±12%の見込み（横ばい圏）"
+    if macro_event:
+        outlook_str += f"　マクロ：{macro_event[:20]}"
+    if mkt_alpha is not None and abs(mkt_alpha) >= 2:
+        ind = "追い風" if mkt_alpha > 0 else "向かい風"
+        outlook_str += f"　セクター{ind}（α {mkt_alpha:+.1f}%）"
 
     return {
-        "macro":       macro_str,
-        "sector":      sector_str,
-        "company":     company_str,
-        "demand":      demand_str,
-        "technical":   tech_str,
-        "outlook_3m":  o3m,
-        "outlook_6m":  o6m,
-        "outlook_12m": o12m,
-        "summary":     summary,
-        "short_term":  short_str,
-        "mid_term":    mid_str,
+        "macro":     macro_str,
+        "sector":    sector_str,
+        "company":   company_str,
+        "demand":    demand_str,
+        "technical": tech_str,
+        "outlook":   outlook_str,
+        "summary":   summary,
     }
 
 
