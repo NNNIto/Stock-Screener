@@ -1103,6 +1103,120 @@ def _build_ranking_page(elems, results: list, s_sub, s_small):
 
 
 # ─────────────────────────────────────────
+# 銘柄分析テキスト生成（GPT優先・ルールベースフォールバック）
+# ─────────────────────────────────────────
+_ANALYSIS_CACHE: dict = {}
+
+def generate_stock_analysis(r: dict) -> list:
+    """分析テキストを箇条書きリストで返す（GPT優先、失敗時はルールベース）"""
+    ticker = r["銘柄コード"]
+    if ticker in _ANALYSIS_CACHE:
+        return _ANALYSIS_CACHE[ticker]
+
+    # ── GPT分析 ──────────────────────────────────
+    if _OPENAI_CLIENT:
+        try:
+            rev   = r.get("売上成長(%)")
+            roe   = r.get("ROE(%)")
+            gross = r.get("粗利率(%)")
+            op    = r.get("営業利益率(%)")
+            rsi   = r.get("RSI14")
+            adx   = r.get("ADX")
+            r60   = r.get("60日リターン(%)")
+            ret1y = r.get("期待リターン_1Y(%)")
+            peg   = r.get("PEG")
+            per   = r.get("PER")
+            strat = r.get("マッチ戦略") or ""
+            name  = r.get("銘柄名") or ticker
+            market= r["市場"]
+            sector= r.get("セクター") or ""
+
+            user_msg = (
+                f"銘柄: {ticker} ({name}) / 市場: {'東証' if market=='JP' else '米国'} / セクター: {sector}\n"
+                f"【ファンダ】売上成長: {rev}% | ROE: {roe}% | 粗利率: {gross}% | 営業利益率: {op}%"
+                f" | PER: {per} | PEG: {peg}\n"
+                f"【テクニカル】RSI14: {rsi} | ADX: {adx} | 60日リターン: {r60}%\n"
+                f"【アナリスト】1年後期待リターン: {ret1y}%\n"
+                f"【通過戦略】{strat}\n\n"
+                "上記データを基に、この銘柄の投資判断に役立つ分析を日本語で3〜4点の箇条書きで提供してください。"
+                "各項目は「・」で始め、投資根拠・強み・リスク・今後の注目ポイントをバランスよく含めてください。"
+                "各項目は1〜2文で簡潔に。数値は積極的に活用してください。"
+            )
+            resp = _OPENAI_CLIENT.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content":
+                     "あなたは機関投資家向けの株式アナリストです。与えられたデータを基に簡潔・具体的な日本語の投資分析を行います。"},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.4,
+                max_tokens=400,
+                timeout=15,
+            )
+            raw = resp.choices[0].message.content or ""
+            lines = [ln.strip() for ln in raw.splitlines() if ln.strip().startswith("・")]
+            if lines:
+                _ANALYSIS_CACHE[ticker] = lines
+                return lines
+        except Exception as e:
+            print(f"    [GPT分析] {ticker}: {e}")
+
+    # ── ルールベースフォールバック ────────────────
+    lines = []
+    rev   = r.get("売上成長(%)")  or 0
+    roe   = r.get("ROE(%)")       or 0
+    gross = r.get("粗利率(%)")    or 0
+    op    = r.get("営業利益率(%)") or 0
+    rsi   = r.get("RSI14")        or 0
+    adx   = r.get("ADX")          or 0
+    r60   = r.get("60日リターン(%)") or 0
+    ret1y = r.get("期待リターン_1Y(%)") or 0
+    peg   = r.get("PEG")
+    strat = r.get("マッチ戦略") or ""
+
+    # 成長性
+    if rev >= 30:
+        lines.append(f"・売上成長率 {rev:.0f}% と高成長フェーズを継続。スケーラブルなビジネスモデルが牽引している。")
+    elif rev >= 15:
+        lines.append(f"・売上成長率 {rev:.0f}% と安定した成長軌道。収益拡大の継続性が期待される。")
+
+    # 収益性
+    if roe >= 20 and gross >= 50:
+        lines.append(f"・ROE {roe:.0f}%・粗利率 {gross:.0f}% と資本効率・収益性ともに高水準。競争優位性が財務に反映されている。")
+    elif roe >= 15:
+        lines.append(f"・ROE {roe:.0f}% と良好な資本効率。株主価値の向上が期待できる水準。")
+
+    # モメンタム / テクニカル
+    if r60 >= 20:
+        lines.append(f"・直近60日で {r60:.0f}% 上昇と強い相対強度を示す。ADX {adx:.0f} によりトレンドの継続性も確認できる。")
+    elif 50 <= rsi <= 70:
+        lines.append(f"・RSI {rsi:.0f} と上昇トレンドの理想ゾーン。過熱感なく追随余地がある。")
+
+    # アナリスト上値
+    if ret1y >= 25:
+        lines.append(f"・アナリストコンセンサスに基づく1年後期待リターンは {ret1y:.1f}%。現在の株価に対して十分な上値余地がある。")
+
+    # PEG
+    if peg and 0 < peg <= 1.0:
+        lines.append(f"・PEG {peg:.2f} と成長率対比で割安水準。グロース株としてのバリュエーション妙味がある。")
+
+    # 戦略
+    if "S1" in strat or "S3" in strat:
+        lines.append("・52週高値ブレイクアウトを達成。新高値圏での買い需要が継続する可能性がある。")
+    if "S6" in strat:
+        lines.append("・モメンタム戦略で最上位評価。相対強度の高さはトレンド継続の根拠となる。")
+
+    # リスク（デフォルト1件）
+    if rsi > 70:
+        lines.append(f"・RSI {rsi:.0f} とやや過熱域。短期的な調整局面に備えたポジション管理が必要。")
+    elif not lines or len(lines) < 2:
+        lines.append("・スクリーニング通過銘柄ではあるが、マクロ環境・業績動向を継続的にモニタリングすること。")
+
+    _ANALYSIS_CACHE[ticker] = lines
+    return lines
+
+
+# ─────────────────────────────────────────
 # チャート生成
 # ─────────────────────────────────────────
 def generate_stock_chart(df: pd.DataFrame, ticker: str, market: str,
@@ -1294,6 +1408,17 @@ def _build_stock_detail(elems, r: dict, s_small, df_raw=None):
             from reportlab.platypus import Image as RLImage
             elems.append(RLImage(chart_buf, width=180*mm, height=90*mm))
             elems.append(Spacer(1, 2 * mm))
+
+    # Section 3.6: 分析コメント
+    analysis_lines = generate_stock_analysis(r)
+    if analysis_lines:
+        elems.append(_section_header("■ 分析コメント", bg=colors.HexColor("#f0f4ff"),
+                                     fg=C_NAVY, font_size=8.5))
+        s_analysis = _style(f"_an_{ticker}", fontSize=8.5, leading=14,
+                            spaceAfter=2, textColor=C_BLACK)
+        for line in analysis_lines:
+            elems.append(_p(line, s_analysis))
+        elems.append(Spacer(1, 2 * mm))
 
     # Section 4: ファンダメンタルズ（3列 × 3行）
     def fund_val(v, good_thresh, bad_thresh=None, suffix="", fmt="{:.1f}"):
