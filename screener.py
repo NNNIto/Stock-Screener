@@ -620,36 +620,6 @@ def calc_expected_returns(target_mean, current_price):
     return round(ret_3m, 1), round(ret_6m, 1), round(ret_1y, 1)
 
 
-# ─────────────────────────────────────────
-# スコアリング
-# ─────────────────────────────────────────
-def calc_score(rec: dict) -> float:
-    score = 0.0
-    # 戦略数 (max 4pts)
-    score += min(rec["マッチ戦略数"] / 7 * 4, 4.0)
-    # 期待リターン1Y (max 3pts)
-    ret = rec.get("期待リターン_1Y(%)")
-    if ret is not None:
-        if ret >= 50:
-            score += 3.0
-        elif ret >= 30:
-            score += 2.0
-        elif ret >= 15:
-            score += 1.0
-    # ファンダメンタルズ (max 2pts)
-    rev = rec.get("売上成長(%)", 0) or 0
-    roe = rec.get("ROE(%)", 0) or 0
-    gross = rec.get("粗利率(%)", 0) or 0
-    score += 0.7 if rev >= 30 else (0.4 if rev >= 15 else 0)
-    score += 0.5 if roe >= 25 else (0.3 if roe >= 15 else 0)
-    score += 0.5 if gross >= 60 else (0.3 if gross >= 40 else 0)
-    # テクニカル (max 1pt)
-    rsi = rec.get("RSI14") or 0
-    adx = rec.get("ADX") or 0
-    score += 0.5 if 50 <= rsi <= 70 else 0
-    score += 0.5 if adx >= 30 else (0.3 if adx >= 25 else 0)
-    return round(min(score, 10.0), 1)
-
 
 # ─────────────────────────────────────────
 # セクター日本語変換
@@ -994,13 +964,13 @@ def run_all_screens(tickers: list, market_map: dict):
                 "マッチ戦略":       " | ".join(hit),
                 "_info":            info,
             }
-            rec["スコア"] = calc_score(rec)
             results.append(rec)
 
         except Exception as e:
             pass
 
-    results_sorted = sorted(results, key=lambda x: -x["スコア"])
+    results_sorted = sorted(results,
+        key=lambda x: (-(x.get("期待リターン_1Y(%)") or -999), -x["マッチ戦略数"]))
     return results_sorted, stock_data_raw
 
 
@@ -1015,13 +985,11 @@ def save_csv(results: list):
         "市場":               r["市場"],
         "銘柄コード":         r["銘柄コード"],
         "銘柄名":             r.get("銘柄名", ""),
-        "スコア":             r["スコア"],
         "現在値":             r["現在値"],
         "目標株価_平均":      r.get("目標株価_平均", ""),
         "期待リターン_3M(%)": r.get("期待リターン_3M(%)", ""),
         "期待リターン_6M(%)": r.get("期待リターン_6M(%)", ""),
         "期待リターン_1Y(%)": r.get("期待リターン_1Y(%)", ""),
-        "アナリスト数":       r.get("アナリスト数", ""),
         "推奨区分":           r.get("推奨区分", ""),
         "RSI14":              r.get("RSI14", ""),
         "ADX":                r.get("ADX", ""),
@@ -1066,39 +1034,45 @@ def save_csv(results: list):
 # ─────────────────────────────────────────
 # PDF生成: ランキングページ用ヘルパー
 # ─────────────────────────────────────────
-def _build_ranking_page(elems, results: list, sort_key: str,
-                        title: str, subtitle: str,
-                        ret_label: str, s_sub, s_small):
-    """期待リターンランキングページを構築"""
-    elems.append(_section_header(title, bg=C_NAVY))
+def _build_ranking_page(elems, results: list, s_sub, s_small):
+    """期待リターン統合ランキングページ（1Y降順・全銘柄・3M/6M/1Yカラム）"""
+    elems.append(_section_header(
+        "期待リターン ランキング（アナリスト平均目標株価ベース）", bg=C_NAVY))
     elems.append(Spacer(1, 2 * mm))
-    elems.append(_p(subtitle, s_small))
-    elems.append(Spacer(1, 2 * mm))
+    elems.append(_p(
+        "※ アナリスト平均目標株価から1年後期待リターンを算出。3ヶ月後=×35%、6ヶ月後=×60%で推定。"
+        "投資判断の参考にとどめてください。", s_small))
+    elems.append(Spacer(1, 3 * mm))
 
     sorted_r = sorted(
-        [r for r in results if r.get(sort_key) is not None],
-        key=lambda x: -(x.get(sort_key) or -999)
-    )[:15]
+        results,
+        key=lambda x: (-(x.get("期待リターン_1Y(%)") or -999), -x["マッチ戦略数"])
+    )
 
     if not sorted_r:
-        elems.append(_p("アナリスト目標株価データのある銘柄がありません", s_small))
+        elems.append(_p("ヒット銘柄がありません", s_small))
         elems.append(PageBreak())
         return
 
-    hdr = ["順位", "ティッカー", "企業名", "セクター", "現在値", "目標株価", ret_label, "アナリスト数", "推奨", "スコア"]
-    col_w = [10*mm, 17*mm, 38*mm, 28*mm, 18*mm, 18*mm, 22*mm, 16*mm, 14*mm, 12*mm]
+    hdr = ["順位", "ティッカー", "企業名", "セクター", "現在値", "目標株価",
+           "3ヶ月後", "6ヶ月後", "1年後", "戦略数"]
+    col_w = [10*mm, 16*mm, 38*mm, 26*mm, 18*mm, 18*mm, 18*mm, 18*mm, 18*mm, 12*mm]
     data = [hdr]
 
     rank_bg = {1: C_GOLD, 2: C_SILVER, 3: C_BRONZE}
     extra_styles = []
 
     for rank, r in enumerate(sorted_r, 1):
-        market   = r["市場"]
-        ret_val  = r.get(sort_key)
-        ret_str  = f"{ret_val:+.1f}%" if ret_val is not None else "N/A"
-        name_s   = (r.get("銘柄名") or r["銘柄コード"])[:20]
-        sector_s = _jp_sector(r.get("セクター") or "")[:16]
-        rec_str  = fmt_rec_key(r.get("推奨区分") or "")
+        market = r["市場"]
+        r3  = r.get("期待リターン_3M(%)")
+        r6  = r.get("期待リターン_6M(%)")
+        r1y = r.get("期待リターン_1Y(%)")
+
+        def fmt_ret(v):
+            return f"{v:+.1f}%" if v is not None else "N/A"
+
+        name_s   = (r.get("銘柄名") or r["銘柄コード"])[:18]
+        sector_s = _jp_sector(r.get("セクター") or "")[:14]
 
         data.append([
             f"#{rank}",
@@ -1107,19 +1081,20 @@ def _build_ranking_page(elems, results: list, sort_key: str,
             sector_s,
             fmt_price(r.get("現在値"), market),
             fmt_price(r.get("目標株価_平均"), market),
-            ret_str,
-            str(r.get("アナリスト数") or 0),
-            rec_str,
-            str(r.get("スコア") or ""),
+            fmt_ret(r3),
+            fmt_ret(r6),
+            fmt_ret(r1y),
+            f"{r['マッチ戦略数']}/7",
         ])
+
+        row_idx = rank
         if rank in rank_bg:
-            row_idx = rank  # data[0]=header, data[1]=rank1...
             extra_styles.append(("BACKGROUND", (0, row_idx), (-1, row_idx), rank_bg[rank]))
-        # 期待リターン列に色を付ける
-        ret_color_val = ret_color(ret_val)
-        if ret_color_val != C_BLACK:
-            row_idx = rank
-            extra_styles.append(("TEXTCOLOR", (6, row_idx), (6, row_idx), ret_color_val))
+        # 期待リターン列3本に色付け (col 6,7,8)
+        for col_i, val in [(6, r3), (7, r6), (8, r1y)]:
+            c = ret_color(val)
+            if c != C_BLACK:
+                extra_styles.append(("TEXTCOLOR", (col_i, row_idx), (col_i, row_idx), c))
 
     elems.append(_tbl(data, col_w, extra_styles=extra_styles))
     elems.append(PageBreak())
@@ -1135,12 +1110,11 @@ def _build_stock_detail(elems, r: dict, s_small):
     name     = r.get("銘柄名") or ticker
     sector   = _jp_sector(r.get("セクター") or "")
     industry = _jp_sector(r.get("業種") or "")
-    score    = r.get("スコア") or 0
     info     = r.get("_info") or {}
 
     # Section 1: ヘッダー帯
     hdr_text = (f"{ticker}  {name}  |  {sector} / {industry}"
-                f"  |  {'国内株（東証）' if market == 'JP' else '米国株'}  |  スコア: {score} / 10.0")
+                f"  |  {'国内株（東証）' if market == 'JP' else '米国株'}")
     elems.append(_section_header(hdr_text, bg=C_NAVY, fg=C_WHITE, font_size=9))
     elems.append(Spacer(1, 2 * mm))
 
@@ -1178,8 +1152,7 @@ def _build_stock_detail(elems, r: dict, s_small):
         [lbl("平均目標株価"),  val(fmt_price(target_mean, market))],
         [lbl("最高目標株価"),  val(fmt_price(target_high, market))],
         [lbl("最低目標株価"),  val(fmt_price(target_low,  market))],
-        [lbl("アナリスト数"),  val(f"{n_analysts}人")],
-        [lbl("推奨分布"),      val(f"買い{buy_c} 中立{hold_c} 売り{sell_c} ({rec_key_jp})")],
+        [lbl("推奨"),          val(rec_key_jp)],
     ]
     price_rows = [
         [lbl("現在値"),       val(fmt_price(close_v, market))],
@@ -1425,45 +1398,15 @@ def generate_pdf(results: list, market_env: dict,
     elems.append(PageBreak())
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # Page 2: 1年後期待リターン ランキング
+    # Page 2: 期待リターン 統合ランキング
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    _build_ranking_page(
-        elems, results,
-        sort_key="期待リターン_1Y(%)",
-        title="1年後 期待リターン ランキング TOP15（アナリスト平均目標株価ベース）",
-        subtitle="※ アナリスト目標株価を起点に1年・6ヶ月・3ヶ月の期待リターンを推定。投資判断の参考にとどめてください。",
-        ret_label="1年後期待リターン",
-        s_sub=s_sub, s_small=s_small,
-    )
+    _build_ranking_page(elems, results, s_sub=s_sub, s_small=s_small)
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # Page 3: 6ヶ月後期待リターン ランキング
+    # Pages 5+: 個別銘柄詳細（1Y期待リターン降順）
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    _build_ranking_page(
-        elems, results,
-        sort_key="期待リターン_6M(%)",
-        title="6ヶ月後 期待リターン ランキング TOP15（アナリスト平均目標株価ベース）",
-        subtitle="※ 1年後期待リターンの60%を6ヶ月後の期待値として推定。",
-        ret_label="6ヶ月後期待リターン",
-        s_sub=s_sub, s_small=s_small,
-    )
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # Page 4: 3ヶ月後期待リターン ランキング
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    _build_ranking_page(
-        elems, results,
-        sort_key="期待リターン_3M(%)",
-        title="3ヶ月後 期待リターン ランキング TOP15（アナリスト平均目標株価ベース）",
-        subtitle="※ 1年後期待リターンの35%を3ヶ月後の期待値として推定。",
-        ret_label="3ヶ月後期待リターン",
-        s_sub=s_sub, s_small=s_small,
-    )
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # Pages 5+: 個別銘柄詳細（スコア降順）
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    detail_results = sorted(results, key=lambda x: -x.get("スコア", 0))
+    detail_results = sorted(results,
+        key=lambda x: (-(x.get("期待リターン_1Y(%)") or -999), -x["マッチ戦略数"]))
     print(f"\n[PDF] 個別銘柄詳細生成中... ({len(detail_results)}銘柄)")
 
     for idx, r in enumerate(detail_results):
@@ -1547,8 +1490,8 @@ if __name__ == "__main__":
     for r in results_all[:5]:
         ret1y = r.get("期待リターン_1Y(%)")
         ret_s = f"{ret1y:+.1f}%" if ret1y is not None else "N/A"
-        print(f"  {r['市場']} {r['銘柄コード']:8s}  スコア:{r['スコア']:4.1f}"
-              f"  1Y期待:{ret_s:>7s}  {r['マッチ戦略'][:55]}")
+        print(f"  {r['市場']} {r['銘柄コード']:8s}  1Y期待:{ret_s:>7s}"
+              f"  戦略:{r['マッチ戦略数']}/7  {r['マッチ戦略'][:55]}")
 
     save_csv(results_all)
     generate_pdf(results_all, market_env, n_jp, n_us)
