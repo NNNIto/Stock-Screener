@@ -1107,125 +1107,175 @@ def _build_ranking_page(elems, results: list, s_sub, s_small):
 # ─────────────────────────────────────────
 _ANALYSIS_CACHE: dict = {}
 
-def generate_stock_analysis(r: dict) -> list:
-    """分析テキストを箇条書きリストで返す（GPT優先、失敗時はルールベース）"""
+def generate_stock_analysis(r: dict) -> dict:
+    """分析テキストを {"強み": [...], "リスク": [...]} で返す（GPT優先、失敗時はルールベース）"""
     ticker = r["銘柄コード"]
     if ticker in _ANALYSIS_CACHE:
         return _ANALYSIS_CACHE[ticker]
 
+    rev   = r.get("売上成長(%)")      or 0
+    roe   = r.get("ROE(%)")           or 0
+    gross = r.get("粗利率(%)")        or 0
+    op    = r.get("営業利益率(%)")    or 0
+    fcf   = r.get("FCFマージン(%)")
+    de    = r.get("DE比率")
+    rsi   = r.get("RSI14")            or 0
+    adx   = r.get("ADX")              or 0
+    r60   = r.get("60日リターン(%)")  or 0
+    r20   = r.get("20日リターン(%)")  or 0
+    ret1y = r.get("期待リターン_1Y(%)") or 0
+    peg   = r.get("PEG")
+    per   = r.get("PER")
+    psr   = r.get("PSR")
+    ratio52w = r.get("高値比(%)")
+    strat = r.get("マッチ戦略")       or ""
+    name  = r.get("銘柄名")           or ticker
+    market = r["市場"]
+    sector = r.get("セクター")        or ""
+
     # ── GPT分析 ──────────────────────────────────
     if _OPENAI_CLIENT:
         try:
-            rev   = r.get("売上成長(%)")
-            roe   = r.get("ROE(%)")
-            gross = r.get("粗利率(%)")
-            op    = r.get("営業利益率(%)")
-            rsi   = r.get("RSI14")
-            adx   = r.get("ADX")
-            r60   = r.get("60日リターン(%)")
-            ret1y = r.get("期待リターン_1Y(%)")
-            peg   = r.get("PEG")
-            per   = r.get("PER")
-            strat = r.get("マッチ戦略") or ""
-            name  = r.get("銘柄名") or ticker
-            market= r["市場"]
-            sector= r.get("セクター") or ""
-
             user_msg = (
                 f"銘柄: {ticker} ({name}) / 市場: {'東証' if market=='JP' else '米国'} / セクター: {sector}\n"
-                f"【ファンダ】売上成長: {rev}% | ROE: {roe}% | 粗利率: {gross}% | 営業利益率: {op}%"
-                f" | PER: {per} | PEG: {peg}\n"
-                f"【テクニカル】RSI14: {rsi} | ADX: {adx} | 60日リターン: {r60}%\n"
+                f"【成長性】売上成長: {rev}% | ROE: {roe}% | 粗利率: {gross}% | 営業利益率: {op}%"
+                f" | FCFマージン: {fcf}%\n"
+                f"【バリュエーション】PER: {per}倍 | PEG: {peg} | PSR: {psr}倍\n"
+                f"【財務健全性】D/E比率: {de}\n"
+                f"【テクニカル】RSI14: {rsi} | ADX: {adx} | 60日リターン: {r60}%"
+                f" | 20日リターン: {r20}% | 52週高値比: {ratio52w}%\n"
                 f"【アナリスト】1年後期待リターン: {ret1y}%\n"
                 f"【通過戦略】{strat}\n\n"
-                "上記データを基に、この銘柄の投資判断に役立つ分析を日本語で3〜4点の箇条書きで提供してください。"
-                "各項目は「・」で始め、投資根拠・強み・リスク・今後の注目ポイントをバランスよく含めてください。"
-                "各項目は1〜2文で簡潔に。数値は積極的に活用してください。"
+                "上記データを基に、以下の構成で日本語の投資分析を作成してください。\n\n"
+                "【投資根拠・強み】\n"
+                "・（2〜3点。成長性・収益性・モメンタム・アナリスト評価など強みを具体的数値付きで）\n\n"
+                "【リスク要因】\n"
+                "・（2〜3点。バリュエーション面・財務面・テクニカル面・マクロ・競合環境など多角的に分析。"
+                "数値が良好でもセクター特有リスクや潜在的な下落シナリオを必ず含めること）\n\n"
+                "各項目は「・」で始め、1〜2文で具体的に。「【投資根拠・強み】」「【リスク要因】」の"
+                "見出し行はそのまま出力してください。"
             )
             resp = _OPENAI_CLIENT.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content":
-                     "あなたは機関投資家向けの株式アナリストです。与えられたデータを基に簡潔・具体的な日本語の投資分析を行います。"},
+                     "あなたは機関投資家向けの証券アナリストです。"
+                     "ポジティブな点だけでなくリスクも率直・具体的に指摘する、バランスのとれた日本語分析を行います。"},
                     {"role": "user", "content": user_msg},
                 ],
                 temperature=0.4,
-                max_tokens=400,
-                timeout=15,
+                max_tokens=600,
+                timeout=20,
             )
             raw = resp.choices[0].message.content or ""
-            lines = [ln.strip() for ln in raw.splitlines() if ln.strip().startswith("・")]
-            if lines:
-                _ANALYSIS_CACHE[ticker] = lines
-                return lines
+            strengths, risks = [], []
+            section = None
+            for ln in raw.splitlines():
+                ln = ln.strip()
+                if "投資根拠" in ln or "強み" in ln:
+                    section = "s"
+                elif "リスク" in ln:
+                    section = "r"
+                elif ln.startswith("・"):
+                    if section == "s":
+                        strengths.append(ln)
+                    elif section == "r":
+                        risks.append(ln)
+            if strengths or risks:
+                result = {"強み": strengths, "リスク": risks}
+                _ANALYSIS_CACHE[ticker] = result
+                return result
         except Exception as e:
             print(f"    [GPT分析] {ticker}: {e}")
 
     # ── ルールベースフォールバック ────────────────
-    lines = []
-    rev   = r.get("売上成長(%)")  or 0
-    roe   = r.get("ROE(%)")       or 0
-    gross = r.get("粗利率(%)")    or 0
-    op    = r.get("営業利益率(%)") or 0
-    rsi   = r.get("RSI14")        or 0
-    adx   = r.get("ADX")          or 0
-    r60   = r.get("60日リターン(%)") or 0
-    ret1y = r.get("期待リターン_1Y(%)") or 0
-    peg   = r.get("PEG")
-    strat = r.get("マッチ戦略") or ""
+    strengths, risks = [], []
 
-    # 成長性
+    # --- 強み ---
     if rev >= 30:
-        lines.append(f"・売上成長率 {rev:.0f}% と高成長フェーズを継続。スケーラブルなビジネスモデルが牽引している。")
+        strengths.append(f"・売上成長率 {rev:.0f}% と高成長フェーズを継続。スケーラブルなビジネスモデルが牽引。")
     elif rev >= 15:
-        lines.append(f"・売上成長率 {rev:.0f}% と安定した成長軌道。収益拡大の継続性が期待される。")
+        strengths.append(f"・売上成長率 {rev:.0f}% と安定した成長軌道。収益拡大の継続性が期待される。")
 
-    # 収益性
     if roe >= 20 and gross >= 50:
-        lines.append(f"・ROE {roe:.0f}%・粗利率 {gross:.0f}% と資本効率・収益性ともに高水準。競争優位性が財務に反映されている。")
+        strengths.append(f"・ROE {roe:.0f}%・粗利率 {gross:.0f}% と資本効率・収益性ともに高水準。競争優位性が財務に表れている。")
     elif roe >= 15:
-        lines.append(f"・ROE {roe:.0f}% と良好な資本効率。株主価値の向上が期待できる水準。")
+        strengths.append(f"・ROE {roe:.0f}% と良好な資本効率。株主価値の向上が期待できる水準。")
 
-    # モメンタム / テクニカル
     if r60 >= 20:
-        lines.append(f"・直近60日で {r60:.0f}% 上昇と強い相対強度を示す。ADX {adx:.0f} によりトレンドの継続性も確認できる。")
+        strengths.append(f"・直近60日 {r60:.0f}% 上昇と強いモメンタム。ADX {adx:.0f} によりトレンドの継続性を確認。")
     elif 50 <= rsi <= 70:
-        lines.append(f"・RSI {rsi:.0f} と上昇トレンドの理想ゾーン。過熱感なく追随余地がある。")
+        strengths.append(f"・RSI {rsi:.0f} と上昇トレンドの理想ゾーン。過熱感なく追随余地あり。")
 
-    # アナリスト上値
     if ret1y >= 25:
-        lines.append(f"・アナリストコンセンサスに基づく1年後期待リターンは {ret1y:.1f}%。現在の株価に対して十分な上値余地がある。")
+        strengths.append(f"・アナリストコンセンサスの1年後期待リターン {ret1y:.1f}%。現在値に対して十分な上値余地。")
 
-    # PEG
     if peg and 0 < peg <= 1.0:
-        lines.append(f"・PEG {peg:.2f} と成長率対比で割安水準。グロース株としてのバリュエーション妙味がある。")
+        strengths.append(f"・PEG {peg:.2f} と成長率対比で割安。グロース株としてのバリュエーション妙味あり。")
 
-    # 戦略
+    if fcf and fcf >= 15:
+        strengths.append(f"・FCFマージン {fcf:.1f}% と強固なキャッシュ創出力。財務の自由度が高い。")
+
     if "S1" in strat or "S3" in strat:
-        lines.append("・52週高値ブレイクアウトを達成。新高値圏での買い需要が継続する可能性がある。")
-    if "S6" in strat:
-        lines.append("・モメンタム戦略で最上位評価。相対強度の高さはトレンド継続の根拠となる。")
+        strengths.append("・52週高値ブレイクアウト達成。新高値圏での継続的な買い需要が見込まれる。")
 
-    # リスク（デフォルト1件）
-    if rsi > 70:
-        lines.append(f"・RSI {rsi:.0f} とやや過熱域。短期的な調整局面に備えたポジション管理が必要。")
-    elif not lines or len(lines) < 2:
-        lines.append("・スクリーニング通過銘柄ではあるが、マクロ環境・業績動向を継続的にモニタリングすること。")
+    # --- リスク ---
+    if rsi > 72:
+        risks.append(f"・RSI {rsi:.0f} と過熱域に突入。短期的な利益確定売りによる調整に注意。")
+    elif r60 >= 40:
+        risks.append(f"・直近60日で {r60:.0f}% の急騰。過去の急騰銘柄は平均回帰リスクがあり、エントリータイミングに注意。")
 
-    _ANALYSIS_CACHE[ticker] = lines
-    return lines
+    if per and per > 60:
+        risks.append(f"・PER {per:.0f}倍と高バリュエーション。業績期待が高く織り込まれており、下方修正時の株価下落幅が大きくなりやすい。")
+    elif psr and psr > 15:
+        risks.append(f"・PSR {psr:.1f}倍と売上比で割高水準。成長鈍化が顕在化した際の株価調整リスクが大きい。")
+    elif peg and peg > 2.0:
+        risks.append(f"・PEG {peg:.2f} と成長率対比で割高。EPS成長の鈍化が株価下落の引き金になりうる。")
+
+    if de and de > 150:
+        risks.append(f"・D/E比率 {de:.0f} と財務レバレッジが高い。金利上昇局面では利払い負担増と信用収縮リスクに注意。")
+    elif de and de > 80 and market == "US":
+        risks.append(f"・D/E比率 {de:.0f} とレバレッジがやや高め。高金利環境の長期化は財務コスト増につながる可能性。")
+
+    if fcf is not None and fcf < 0:
+        risks.append(f"・FCFマージン {fcf:.1f}% と現時点ではフリーキャッシュフローが赤字。資金調達リスクと希薄化に警戒。")
+    elif fcf is not None and fcf < 5:
+        risks.append(f"・FCFマージン {fcf:.1f}% と薄い。成長投資と収益化のバランスが今後の重要な確認ポイント。")
+
+    if op < 0:
+        risks.append(f"・営業利益率 {op:.1f}% と赤字。損益分岐点到達の時期が投資判断の鍵を握る。")
+    elif op < 5:
+        risks.append(f"・営業利益率 {op:.1f}% と薄利。競合激化やコスト増が利益率をさらに圧迫するリスクがある。")
+
+    if ratio52w is not None and ratio52w < -25:
+        risks.append(f"・52週高値比 {ratio52w:.1f}% と高値から大幅下落中。下降トレンド継続の可能性も考慮すべき。")
+
+    # リスクが少ない場合の汎用追加
+    if len(risks) < 2:
+        risks.append("・マクロ環境（金利・為替・景気減速）の変化が株価に影響しうる。ポートフォリオ全体のリスク管理を徹底すること。")
+    if len(risks) < 2:
+        risks.append("・アナリスト目標株価はコンセンサス時点の情報であり、業績や市場環境の変化で修正される可能性がある。")
+
+    if not strengths:
+        strengths.append("・スクリーニング基準を通過。各指標の詳細確認を推奨。")
+
+    result = {"強み": strengths, "リスク": risks}
+    _ANALYSIS_CACHE[ticker] = result
+    return result
 
 
 # ─────────────────────────────────────────
 # チャート生成
 # ─────────────────────────────────────────
 def generate_stock_chart(df: pd.DataFrame, ticker: str, market: str,
-                         target_price=None):
-    """株価チャート（終値+SMA+出来高）を生成してBytesIOを返す"""
+                         target_price=None, ret_3m=None, ret_6m=None, ret_1y=None):
+    """株価チャート（終値+SMA+出来高+予測ライン）を生成してBytesIOを返す"""
     try:
         df_c = calc_indicators(df).iloc[-180:]
         if len(df_c) < 30:
             return None
+
+        import pandas.tseries.offsets as offsets
 
         p      = MARKET_PARAMS[market]
         close  = df_c["Close"]
@@ -1233,10 +1283,25 @@ def generate_stock_chart(df: pd.DataFrame, ticker: str, market: str,
         sma_m  = df_c.get(p["sma_m"], pd.Series(dtype=float))
         sma_l  = df_c.get("SMA200",   pd.Series(dtype=float))
 
+        last_date  = close.index[-1]
+        last_price = float(close.iloc[-1])
+
+        # 予測ポイント（営業日ベース）
+        forecast_pts = []
+        for ret, days, label, color in [
+            (ret_3m,  63,  "3ヶ月後予測", "#9333ea"),
+            (ret_6m,  126, "6ヶ月後予測", "#0891b2"),
+            (ret_1y,  252, "1年後予測",   "#15803d"),
+        ]:
+            if ret is not None:
+                fdate = last_date + pd.tseries.offsets.BDay(days)
+                fprice = last_price * (1 + ret / 100)
+                forecast_pts.append((fdate, fprice, label, color))
+
         fig, (ax1, ax2) = plt.subplots(
             2, 1, figsize=(9, 4.5),
             gridspec_kw={"height_ratios": [3, 1]},
-            sharex=True,
+            sharex=False,
         )
         fig.patch.set_facecolor("white")
 
@@ -1250,23 +1315,36 @@ def generate_stock_chart(df: pd.DataFrame, ticker: str, market: str,
                      linestyle="--", label="SMA200")
         if target_price and target_price > 0:
             ax1.axhline(target_price, color="#15803d", linewidth=1.0,
-                        linestyle=":", label=f"目標株価 {target_price:,.1f}")
+                        linestyle=":", label=f"目標株価 {target_price:,.0f}")
+
+        # 予測ライン（現在値→予測点 の破線＋マーカー）
+        for fdate, fprice, label, fcolor in forecast_pts:
+            ax1.plot([last_date, fdate], [last_price, fprice],
+                     color=fcolor, linewidth=1.2, linestyle="-.",
+                     marker="o", markersize=5,
+                     label=f"{label}: {fprice:,.0f}")
+            ax1.annotate(f"{fprice:,.0f}",
+                         xy=(fdate, fprice),
+                         xytext=(4, 3), textcoords="offset points",
+                         fontsize=6, color=fcolor)
 
         ax1.set_facecolor("white")
         ax1.grid(True, alpha=0.3, linewidth=0.5)
         ax1.tick_params(labelsize=7)
-        ax1.yaxis.set_major_formatter(
-            mticker.FuncFormatter(lambda x, _: f"{x:,.0f}"))
-        legend_kw = {"loc": "upper left", "fontsize": 6.5}
+        ax1.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x:,.0f}"))
+        legend_kw = {"loc": "upper left", "fontsize": 6, "ncol": 2}
         if _MPL_FP:
-            legend_kw["prop"] = _MPL_FP
+            legend_kw["prop"] = FontProperties(fname=_FONT_PATH, size=6)
         ax1.legend(**legend_kw)
         title_kw = {"fontsize": 9}
         if _MPL_FP:
             title_kw["fontproperties"] = _MPL_FP
-        ax1.set_title(f"{ticker}  直近180日チャート", **title_kw)
+        ax1.set_title(f"{ticker}  直近180日 + 予測ライン（アナリスト目標株価ベース）", **title_kw)
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter("%y/%m"))
+        ax1.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=30, fontsize=6)
 
-        # ── 下段: 出来高 ──
+        # ── 下段: 出来高（履歴部分のみ） ──
         bar_colors = ["#dc2626" if float(c) < float(o) else "#15803d"
                       for c, o in zip(df_c["Close"], df_c["Open"])]
         ax2.bar(volume.index, volume, color=bar_colors, alpha=0.65, width=1)
@@ -1280,7 +1358,6 @@ def generate_stock_chart(df: pd.DataFrame, ticker: str, market: str,
         if _MPL_FP:
             ylabel_kw["fontproperties"] = _MPL_FP
         ax2.set_ylabel("出来高", **ylabel_kw)
-
         ax2.xaxis.set_major_formatter(mdates.DateFormatter("%y/%m"))
         ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
         plt.setp(ax2.xaxis.get_majorticklabels(), rotation=30, fontsize=6)
@@ -1402,22 +1479,35 @@ def _build_stock_detail(elems, r: dict, s_small, df_raw=None):
 
     # Section 3.5: 株価チャート
     if df_raw is not None:
-        chart_buf = generate_stock_chart(df_raw, ticker, market,
-                                         target_price=target_mean)
+        chart_buf = generate_stock_chart(
+            df_raw, ticker, market,
+            target_price=target_mean,
+            ret_3m=r.get("期待リターン_3M(%)"),
+            ret_6m=r.get("期待リターン_6M(%)"),
+            ret_1y=r.get("期待リターン_1Y(%)"),
+        )
         if chart_buf:
             from reportlab.platypus import Image as RLImage
             elems.append(RLImage(chart_buf, width=180*mm, height=90*mm))
             elems.append(Spacer(1, 2 * mm))
 
-    # Section 3.6: 分析コメント
-    analysis_lines = generate_stock_analysis(r)
-    if analysis_lines:
-        elems.append(_section_header("■ 分析コメント", bg=colors.HexColor("#f0f4ff"),
-                                     fg=C_NAVY, font_size=8.5))
-        s_analysis = _style(f"_an_{ticker}", fontSize=8.5, leading=14,
-                            spaceAfter=2, textColor=C_BLACK)
-        for line in analysis_lines:
-            elems.append(_p(line, s_analysis))
+    # Section 3.6: 分析コメント（強み／リスク 2段構成）
+    analysis = generate_stock_analysis(r)
+    s_pos = _style(f"_ap_{ticker}", fontSize=8.5, leading=14, spaceAfter=1, textColor=C_BLACK)
+    s_neg = _style(f"_ar_{ticker}", fontSize=8.5, leading=14, spaceAfter=1,
+                   textColor=colors.HexColor("#b91c1c"))
+    strengths = analysis.get("強み", [])
+    risks     = analysis.get("リスク", [])
+    if strengths or risks:
+        elems.append(_section_header("■ 投資根拠・強み", bg=colors.HexColor("#e8f5e9"),
+                                     fg=colors.HexColor("#15803d"), font_size=8.5))
+        for line in strengths:
+            elems.append(_p(line, s_pos))
+        elems.append(Spacer(1, 1 * mm))
+        elems.append(_section_header("■ リスク要因", bg=colors.HexColor("#fff3e0"),
+                                     fg=colors.HexColor("#b45309"), font_size=8.5))
+        for line in risks:
+            elems.append(_p(line, s_neg))
         elems.append(Spacer(1, 2 * mm))
 
     # Section 4: ファンダメンタルズ（3列 × 3行）
