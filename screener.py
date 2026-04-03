@@ -43,6 +43,8 @@ except Exception as _e:
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.ticker as mticker
 from matplotlib.font_manager import FontProperties, fontManager
 
 # ── 翻訳 ──────────────────────────────────
@@ -1101,9 +1103,93 @@ def _build_ranking_page(elems, results: list, s_sub, s_small):
 
 
 # ─────────────────────────────────────────
+# チャート生成
+# ─────────────────────────────────────────
+def generate_stock_chart(df: pd.DataFrame, ticker: str, market: str,
+                         target_price=None):
+    """株価チャート（終値+SMA+出来高）を生成してBytesIOを返す"""
+    try:
+        df_c = calc_indicators(df).iloc[-180:]
+        if len(df_c) < 30:
+            return None
+
+        p      = MARKET_PARAMS[market]
+        close  = df_c["Close"]
+        volume = df_c["Volume"]
+        sma_m  = df_c.get(p["sma_m"], pd.Series(dtype=float))
+        sma_l  = df_c.get("SMA200",   pd.Series(dtype=float))
+
+        fig, (ax1, ax2) = plt.subplots(
+            2, 1, figsize=(9, 4.5),
+            gridspec_kw={"height_ratios": [3, 1]},
+            sharex=True,
+        )
+        fig.patch.set_facecolor("white")
+
+        # ── 上段: 株価 + SMA ──
+        ax1.plot(close.index, close, color="#2563a8", linewidth=1.3, label="終値")
+        if not sma_m.isnull().all():
+            ax1.plot(sma_m.index, sma_m, color="#f57c00", linewidth=0.9,
+                     linestyle="--", label=p["sma_m"])
+        if not sma_l.isnull().all():
+            ax1.plot(sma_l.index, sma_l, color="#dc2626", linewidth=0.9,
+                     linestyle="--", label="SMA200")
+        if target_price and target_price > 0:
+            ax1.axhline(target_price, color="#15803d", linewidth=1.0,
+                        linestyle=":", label=f"目標株価 {target_price:,.1f}")
+
+        ax1.set_facecolor("white")
+        ax1.grid(True, alpha=0.3, linewidth=0.5)
+        ax1.tick_params(labelsize=7)
+        ax1.yaxis.set_major_formatter(
+            mticker.FuncFormatter(lambda x, _: f"{x:,.0f}"))
+        legend_kw = {"loc": "upper left", "fontsize": 6.5}
+        if _MPL_FP:
+            legend_kw["prop"] = _MPL_FP
+        ax1.legend(**legend_kw)
+        title_kw = {"fontsize": 9}
+        if _MPL_FP:
+            title_kw["fontproperties"] = _MPL_FP
+        ax1.set_title(f"{ticker}  直近180日チャート", **title_kw)
+
+        # ── 下段: 出来高 ──
+        bar_colors = ["#dc2626" if float(c) < float(o) else "#15803d"
+                      for c, o in zip(df_c["Close"], df_c["Open"])]
+        ax2.bar(volume.index, volume, color=bar_colors, alpha=0.65, width=1)
+        ax2.set_facecolor("white")
+        ax2.grid(True, alpha=0.3, linewidth=0.5)
+        ax2.tick_params(labelsize=6)
+        ax2.yaxis.set_major_formatter(
+            mticker.FuncFormatter(
+                lambda x, _: f"{x/1e6:.0f}M" if x >= 1e6 else f"{x/1e3:.0f}K"))
+        ylabel_kw = {"fontsize": 6.5}
+        if _MPL_FP:
+            ylabel_kw["fontproperties"] = _MPL_FP
+        ax2.set_ylabel("出来高", **ylabel_kw)
+
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter("%y/%m"))
+        ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+        plt.setp(ax2.xaxis.get_majorticklabels(), rotation=30, fontsize=6)
+
+        plt.tight_layout(pad=0.5)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        print(f"    [Chart] {ticker} 生成エラー: {e}")
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return None
+
+
+# ─────────────────────────────────────────
 # PDF生成: 個別銘柄詳細ページ
 # ─────────────────────────────────────────
-def _build_stock_detail(elems, r: dict, s_small):
+def _build_stock_detail(elems, r: dict, s_small, df_raw=None):
     """個別銘柄詳細ページを構築"""
     market   = r["市場"]
     ticker   = r["銘柄コード"]
@@ -1199,6 +1285,15 @@ def _build_stock_detail(elems, r: dict, s_small):
     else:
         elems.append(_section_header("アナリスト目標株価データなし", bg=C_LBLUE, fg=C_NAVY, font_size=9))
     elems.append(Spacer(1, 2 * mm))
+
+    # Section 3.5: 株価チャート
+    if df_raw is not None:
+        chart_buf = generate_stock_chart(df_raw, ticker, market,
+                                         target_price=target_mean)
+        if chart_buf:
+            from reportlab.platypus import Image as RLImage
+            elems.append(RLImage(chart_buf, width=180*mm, height=90*mm))
+            elems.append(Spacer(1, 2 * mm))
 
     # Section 4: ファンダメンタルズ（3列 × 3行）
     def fund_val(v, good_thresh, bad_thresh=None, suffix="", fmt="{:.1f}"):
@@ -1311,8 +1406,9 @@ def _build_stock_detail(elems, r: dict, s_small):
 # PDF生成: メイン
 # ─────────────────────────────────────────
 def generate_pdf(results: list, market_env: dict,
-                 n_screened_jp: int, n_screened_us: int):
-    """完全新設計PDF生成（チャート・GPT分析なし）"""
+                 n_screened_jp: int, n_screened_us: int,
+                 stock_data_raw: dict = None):
+    """完全新設計PDF生成"""
     if not results:
         print("ヒット銘柄なし")
         return
@@ -1385,16 +1481,6 @@ def generate_pdf(results: list, market_env: dict,
         elems.append(_tbl(env_rows, [60*mm, 50*mm, 70*mm]))
         elems.append(Spacer(1, 5 * mm))
 
-    # 戦略別ヒット数
-    strat_data = [["戦略", "国内ヒット", "米国ヒット", "合計"]]
-    for sname in STRATEGIES:
-        hits = [r for r in results if sname in r["マッチ戦略"]]
-        jp_s = sum(1 for r in hits if r["市場"] == "JP")
-        us_s = sum(1 for r in hits if r["市場"] == "US")
-        strat_data.append([sname, str(jp_s), str(us_s), str(len(hits))])
-
-    elems.append(_p("■ 戦略別ヒット数", s_cover_sub))
-    elems.append(_tbl(strat_data, [90*mm, 28*mm, 28*mm, 34*mm]))
     elems.append(PageBreak())
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1411,7 +1497,8 @@ def generate_pdf(results: list, market_env: dict,
 
     for idx, r in enumerate(detail_results):
         print(f"  [{idx+1}/{len(detail_results)}] {r['銘柄コード']} ...")
-        _build_stock_detail(elems, r, s_small)
+        df_raw = (stock_data_raw or {}).get(r["銘柄コード"])
+        _build_stock_detail(elems, r, s_small, df_raw=df_raw)
         if idx < len(detail_results) - 1:
             elems.append(PageBreak())
 
@@ -1494,7 +1581,7 @@ if __name__ == "__main__":
               f"  戦略:{r['マッチ戦略数']}/7  {r['マッチ戦略'][:55]}")
 
     save_csv(results_all)
-    generate_pdf(results_all, market_env, n_jp, n_us)
+    generate_pdf(results_all, market_env, n_jp, n_us, stock_data_raw)
 
     # ── 実行後 Git コミット & プッシュ ──────────────────
     _repo = os.path.dirname(os.path.abspath(__file__))
