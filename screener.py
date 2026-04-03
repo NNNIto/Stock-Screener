@@ -1265,6 +1265,169 @@ def generate_stock_analysis(r: dict) -> dict:
 
 
 # ─────────────────────────────────────────
+# 値動き予測の根拠・シナリオ生成
+# ─────────────────────────────────────────
+_FORECAST_CACHE: dict = {}
+
+def generate_forecast_rationale(r: dict) -> dict:
+    """
+    予測根拠・シナリオを {"根拠": str, "強気": str, "基本": str, "弱気": str} で返す。
+    GPT優先、失敗時はルールベース。
+    """
+    ticker = r["銘柄コード"]
+    if ticker in _FORECAST_CACHE:
+        return _FORECAST_CACHE[ticker]
+
+    ret1y = r.get("期待リターン_1Y(%)")
+    if ret1y is None:
+        return {}
+
+    name    = r.get("銘柄名") or ticker
+    market  = r["市場"]
+    sector  = r.get("セクター") or ""
+    rev     = r.get("売上成長(%)")   or 0
+    roe     = r.get("ROE(%)")        or 0
+    gross   = r.get("粗利率(%)")     or 0
+    op      = r.get("営業利益率(%)") or 0
+    fcf     = r.get("FCFマージン(%)")
+    per     = r.get("PER")
+    peg     = r.get("PEG")
+    psr     = r.get("PSR")
+    de      = r.get("DE比率")
+    rsi     = r.get("RSI14")         or 0
+    adx     = r.get("ADX")           or 0
+    r60     = r.get("60日リターン(%)") or 0
+    ret3m   = r.get("期待リターン_3M(%)") or 0
+    ret6m   = r.get("期待リターン_6M(%)") or 0
+    strat   = r.get("マッチ戦略")    or ""
+    tgt_mean = r.get("目標株価_平均")
+    tgt_high = r.get("目標株価_最高")
+    tgt_low  = r.get("目標株価_最低")
+    cur      = r.get("現在値")
+
+    # ── GPT ───────────────────────────────────
+    if _OPENAI_CLIENT:
+        try:
+            cur_str  = f"{cur:,.1f}" if cur else "N/A"
+            tgt_str  = f"{tgt_mean:,.1f}" if tgt_mean else "N/A"
+            hi_str   = f"{tgt_high:,.1f}" if tgt_high else "N/A"
+            lo_str   = f"{tgt_low:,.1f}"  if tgt_low  else "N/A"
+            curr_sym = "¥" if market == "JP" else "$"
+
+            user_msg = (
+                f"銘柄: {ticker} ({name}) / {'東証' if market=='JP' else '米国'} / {sector}\n"
+                f"【現在値】{curr_sym}{cur_str}　【アナリスト目標株価】平均{curr_sym}{tgt_str}"
+                f"（高値{curr_sym}{hi_str} / 安値{curr_sym}{lo_str}）\n"
+                f"【期待リターン】3ヶ月: +{ret3m:.1f}%  6ヶ月: +{ret6m:.1f}%  1年: +{ret1y:.1f}%\n"
+                f"【ファンダ】売上成長: {rev}% | ROE: {roe}% | 粗利率: {gross}%"
+                f" | 営業利益率: {op}% | FCF: {fcf}% | D/E: {de}\n"
+                f"【バリュエーション】PER: {per}倍 | PEG: {peg} | PSR: {psr}倍\n"
+                f"【テクニカル】RSI: {rsi} | ADX: {adx} | 60日リターン: {r60}%\n"
+                f"【通過戦略】{strat}\n\n"
+                "アナリストが設定した目標株価への到達を前提に、以下の4項目を日本語で作成してください。\n\n"
+                "【予測根拠】\n"
+                "（2〜3文。なぜこの目標株価が設定されているか。業績トレンド・成長ドライバー・"
+                "バリュエーション拡大余地・セクター追い風など具体的な根拠を述べる）\n\n"
+                "【強気シナリオ】\n"
+                "（1〜2文。目標株価を上回るシナリオ。どんな好材料・条件が揃えば上振れるか）\n\n"
+                "【基本シナリオ】\n"
+                "（1〜2文。アナリスト目標通りに進む想定。主要な前提条件を示す）\n\n"
+                "【弱気シナリオ】\n"
+                "（1〜2文。目標に届かない下振れシナリオ。どんなリスクが顕在化すると下振れるか）\n\n"
+                "各見出し行（【予測根拠】等）はそのまま出力し、内容はその直後に記載してください。"
+                "数値・具体的な事象を盛り込み、抽象論は避けてください。"
+            )
+            resp = _OPENAI_CLIENT.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content":
+                     "あなたはバイサイドの証券アナリストです。株価予測の根拠とシナリオ分析を"
+                     "具体的かつ簡潔な日本語で行います。"},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.4,
+                max_tokens=600,
+                timeout=20,
+            )
+            raw = resp.choices[0].message.content or ""
+            # パース
+            result = {}
+            current_key = None
+            buf = []
+            key_map = {"予測根拠": "根拠", "強気シナリオ": "強気",
+                       "基本シナリオ": "基本", "弱気シナリオ": "弱気"}
+            for ln in raw.splitlines():
+                ln = ln.strip()
+                matched = next((v for k, v in key_map.items() if k in ln), None)
+                if matched:
+                    if current_key and buf:
+                        result[current_key] = " ".join(buf).strip()
+                    current_key = matched
+                    buf = []
+                elif current_key and ln:
+                    buf.append(ln)
+            if current_key and buf:
+                result[current_key] = " ".join(buf).strip()
+            if result:
+                _FORECAST_CACHE[ticker] = result
+                return result
+        except Exception as e:
+            print(f"    [GPT予測根拠] {ticker}: {e}")
+
+    # ── ルールベース ──────────────────────────
+    result = {}
+
+    # 根拠
+    basis_parts = []
+    if rev >= 25:
+        basis_parts.append(f"売上高が{rev:.0f}%成長と高い軌道にあり、市場シェア拡大が継続している。")
+    elif rev >= 10:
+        basis_parts.append(f"売上高{rev:.0f}%成長と安定した収益拡大が続いており、業績の可視性が高い。")
+    if roe >= 20:
+        basis_parts.append(f"ROE {roe:.0f}%・粗利率 {gross:.0f}%と収益構造が優秀で、利益の質が高い。")
+    if peg and 0 < peg < 1.5:
+        basis_parts.append(f"PEG {peg:.2f}と成長率対比のバリュエーションが割安であり、"
+                           f"利益成長によるバリュエーション切り上がりが期待できる。")
+    if r60 >= 15:
+        basis_parts.append(f"直近60日で{r60:.0f}%上昇と相対強度が高く、機関投資家の継続的な資金流入が確認できる。")
+    if not basis_parts:
+        basis_parts.append(f"アナリストコンセンサスの平均目標株価が現在値より{ret1y:.1f}%高い水準に設定されており、"
+                           f"業績成長の継続と複数カタリストの顕在化を前提とした評価となっている。")
+    result["根拠"] = " ".join(basis_parts)
+
+    # 強気シナリオ
+    bull = []
+    if rev >= 20:
+        bull.append(f"売上成長がさらに加速（{rev:.0f}%超）し、営業レバレッジが効いて利益率が大幅改善した場合。")
+    if per and per < 40:
+        bull.append(f"市場全体のリスクオンが継続し、バリュエーション倍率（現PER {per:.0f}倍）が拡大する展開。")
+    if not bull:
+        bull.append("業績上振れ・新規大型契約・規制緩和など正のカタリストが重なった場合に目標株価を上回る可能性。")
+    result["強気"] = " ".join(bull)
+
+    # 基本シナリオ
+    base = [f"現在の売上成長率（{rev:.0f}%）と収益性（営業利益率 {op:.0f}%）が維持され、"
+            f"アナリスト予想通りの業績推移が続く想定。"]
+    if adx >= 25:
+        base.append(f"テクニカル面でも上昇トレンド（ADX {adx:.0f}）が継続し、{ret1y:.1f}%の上値到達を目指す。")
+    result["基本"] = " ".join(base)
+
+    # 弱気シナリオ
+    bear = []
+    if per and per > 50:
+        bear.append(f"PER {per:.0f}倍の高バリュエーションが維持できず、業績成長の鈍化とともにマルチプル圧縮が起きるリスク。")
+    if de and de > 100:
+        bear.append(f"D/E比率 {de:.0f}と負債が多く、金利上昇・景気悪化局面での財務圧迫が懸念される。")
+    if not bear:
+        bear.append("マクロ逆風（景気後退・金利上昇）や競合台頭による成長鈍化が顕在化した場合、"
+                    f"目標株価への到達が遅れ、想定リターンを下回るリスクがある。")
+    result["弱気"] = " ".join(bear)
+
+    _FORECAST_CACHE[ticker] = result
+    return result
+
+
+# ─────────────────────────────────────────
 # チャート生成
 # ─────────────────────────────────────────
 def generate_stock_chart(df: pd.DataFrame, ticker: str, market: str,
@@ -1508,6 +1671,35 @@ def _build_stock_detail(elems, r: dict, s_small, df_raw=None):
                                      fg=colors.HexColor("#b45309"), font_size=8.5))
         for line in risks:
             elems.append(_p(line, s_neg))
+        elems.append(Spacer(1, 2 * mm))
+
+    # Section 3.7: 値動き予測根拠・シナリオ
+    forecast = generate_forecast_rationale(r)
+    if forecast:
+        s_fc_body = _style(f"_fc_{ticker}", fontSize=8.5, leading=14, spaceAfter=1, textColor=C_BLACK)
+        s_bull = _style(f"_fb_{ticker}", fontSize=8.5, leading=14, spaceAfter=1,
+                        textColor=colors.HexColor("#15803d"))
+        s_base = _style(f"_fba_{ticker}", fontSize=8.5, leading=14, spaceAfter=1,
+                        textColor=colors.HexColor("#1d4ed8"))
+        s_bear = _style(f"_fbe_{ticker}", fontSize=8.5, leading=14, spaceAfter=1,
+                        textColor=colors.HexColor("#b91c1c"))
+        elems.append(_section_header("■ 値動き予測根拠", bg=colors.HexColor("#ede9fe"),
+                                     fg=colors.HexColor("#6d28d9"), font_size=8.5))
+        if forecast.get("根拠"):
+            elems.append(_p(forecast["根拠"], s_fc_body))
+        elems.append(Spacer(1, 1 * mm))
+        elems.append(_section_header("  強気シナリオ", bg=colors.HexColor("#dcfce7"),
+                                     fg=colors.HexColor("#15803d"), font_size=8.5))
+        if forecast.get("強気"):
+            elems.append(_p(forecast["強気"], s_bull))
+        elems.append(_section_header("  基本シナリオ", bg=colors.HexColor("#dbeafe"),
+                                     fg=colors.HexColor("#1d4ed8"), font_size=8.5))
+        if forecast.get("基本"):
+            elems.append(_p(forecast["基本"], s_base))
+        elems.append(_section_header("  弱気シナリオ", bg=colors.HexColor("#fee2e2"),
+                                     fg=colors.HexColor("#b91c1c"), font_size=8.5))
+        if forecast.get("弱気"):
+            elems.append(_p(forecast["弱気"], s_bear))
         elems.append(Spacer(1, 2 * mm))
 
     # Section 4: ファンダメンタルズ（3列 × 3行）
