@@ -1428,6 +1428,161 @@ def generate_forecast_rationale(r: dict) -> dict:
 
 
 # ─────────────────────────────────────────
+# 競合・需要予測・着目点 生成
+# ─────────────────────────────────────────
+_OUTLOOK_CACHE: dict = {}
+
+def generate_market_outlook(r: dict) -> dict:
+    """
+    競合環境・需要予測・着目すべき事項を
+    {"競合": str, "需要": str, "着目点": [str, ...]} で返す。
+    GPT優先、失敗時はルールベース。
+    """
+    ticker = r["銘柄コード"]
+    if ticker in _OUTLOOK_CACHE:
+        return _OUTLOOK_CACHE[ticker]
+
+    name   = r.get("銘柄名") or ticker
+    market = r["市場"]
+    sector = r.get("セクター") or ""
+    indust = r.get("業種")    or ""
+    rev    = r.get("売上成長(%)")   or 0
+    gross  = r.get("粗利率(%)")     or 0
+    op     = r.get("営業利益率(%)") or 0
+    fcf    = r.get("FCFマージン(%)")
+    per    = r.get("PER")
+    psr    = r.get("PSR")
+    ret1y  = r.get("期待リターン_1Y(%)") or 0
+    strat  = r.get("マッチ戦略") or ""
+    r60    = r.get("60日リターン(%)") or 0
+
+    # ── GPT ──────────────────────────────────
+    if _OPENAI_CLIENT:
+        try:
+            user_msg = (
+                f"銘柄: {ticker} ({name}) / {'東証' if market=='JP' else '米国'} / {sector} / {indust}\n"
+                f"【成長性】売上成長: {rev}% | 粗利率: {gross}% | 営業利益率: {op}%"
+                f" | FCFマージン: {fcf}%\n"
+                f"【バリュエーション】PER: {per}倍 | PSR: {psr}倍\n"
+                f"【アナリスト1年期待リターン】{ret1y:.1f}%\n"
+                f"【60日リターン】{r60:.1f}%\n"
+                f"【通過戦略】{strat}\n\n"
+                "以下の3項目を日本語で作成してください。\n\n"
+                "【競合環境】\n"
+                "（2〜3文。主要な競合他社名を具体的に挙げ、当該銘柄の差別化要因・競争優位性・"
+                "市場シェアの状況を述べる。競合に対して優位か劣位かも明確に）\n\n"
+                "【需要予測・市場トレンド】\n"
+                "（2〜3文。当該企業が属する市場のTAM規模・成長率・主要な需要ドライバーを示し、"
+                "今後3〜5年の業界トレンドと当社への追い風・逆風を具体的に述べる）\n\n"
+                "【今後着目すべき事項】\n"
+                "・（3〜4点。次の決算発表・製品ローンチ・規制動向・M&A・マクロイベントなど、"
+                "株価に影響しうる具体的なカタリストやリスクイベントを箇条書きで。"
+                "時期・数値・固有名詞を盛り込み抽象論は避ける）\n\n"
+                "各見出し行（【競合環境】等）はそのまま出力してください。"
+            )
+            resp = _OPENAI_CLIENT.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content":
+                     "あなたはセクターアナリストです。競合分析・市場調査・カタリスト分析を"
+                     "具体的かつ簡潔な日本語で行います。固有名詞・数値を積極的に使用してください。"},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.4,
+                max_tokens=700,
+                timeout=20,
+            )
+            raw = resp.choices[0].message.content or ""
+            result = {"競合": "", "需要": "", "着目点": []}
+            current_key = None
+            buf = []
+            key_map = {"競合環境": "競合", "需要予測": "需要",
+                       "市場トレンド": "需要", "着目すべき": "着目点"}
+            for ln in raw.splitlines():
+                ln = ln.strip()
+                matched = next((v for k, v in key_map.items() if k in ln), None)
+                if matched:
+                    if current_key:
+                        content = " ".join(buf).strip()
+                        if current_key == "着目点":
+                            result["着目点"] = [l.strip() for l in " ".join(buf).split("・") if l.strip()]
+                        elif content:
+                            result[current_key] = content
+                    current_key = matched
+                    buf = []
+                elif current_key and ln:
+                    buf.append(ln)
+            if current_key and buf:
+                content = " ".join(buf).strip()
+                if current_key == "着目点":
+                    result["着目点"] = [l.strip() for l in " ".join(buf).split("・") if l.strip()]
+                elif content:
+                    result[current_key] = content
+            if result.get("競合") or result.get("需要") or result.get("着目点"):
+                _OUTLOOK_CACHE[ticker] = result
+                return result
+        except Exception as e:
+            print(f"    [GPT競合・需要] {ticker}: {e}")
+
+    # ── ルールベースフォールバック ──────────────
+    result = {"競合": "", "需要": "", "着目点": []}
+
+    # 競合
+    sector_lower = sector.lower()
+    if "technology" in sector_lower or "テクノロジー" in sector:
+        result["競合"] = (
+            f"{name}はテクノロジーセクターに属し、同業大手との製品・サービス差別化が鍵となる。"
+            f"粗利率{gross:.0f}%は業界内での価格決定力・競争優位性の高さを示している。"
+        )
+    elif "health" in sector_lower or "医療" in sector or "医薬" in sector:
+        result["競合"] = (
+            f"医療・ヘルスケアセクターでは特許・規制承認が参入障壁となり、競合との差別化が比較的維持しやすい。"
+            f"粗利率{gross:.0f}%と高い収益性は競争優位の裏付け。"
+        )
+    elif "financial" in sector_lower or "金融" in sector:
+        result["競合"] = (
+            f"金融セクターは規制環境・資本コストが競争構造を規定する。"
+            f"ROEと自己資本比率が同業他社比較の主要指標となる。"
+        )
+    else:
+        result["競合"] = (
+            f"{name}は{sector}セクターに属し、粗利率{gross:.0f}%・営業利益率{op:.0f}%から"
+            f"業界内での一定の競争優位性が示唆される。詳細な競合比較は最新IR資料を参照のこと。"
+        )
+
+    # 需要
+    if rev >= 25:
+        result["需要"] = (
+            f"売上成長率{rev:.0f}%は市場全体の成長を上回る水準であり、同社が属する市場の需要拡大と"
+            f"シェア獲得が同時進行していることを示す。業界のDX・デジタル化・AI活用の波が主要な需要ドライバー。"
+        )
+    elif rev >= 10:
+        result["需要"] = (
+            f"売上成長率{rev:.0f}%と安定した需要環境が続いている。"
+            f"中長期的には業界構造変化（デジタル化・グローバル展開）が成長を下支えする見通し。"
+        )
+    else:
+        result["需要"] = (
+            f"成熟市場での安定需要が基盤。コスト効率化・新規サービス展開による収益性向上が成長の鍵。"
+        )
+
+    # 着目点
+    watch = []
+    watch.append("次回決算発表での売上ガイダンス・利益率の上方修正有無")
+    if rev >= 20:
+        watch.append("海外展開・新規プロダクト投入による成長加速の兆候")
+    if per and per > 40:
+        watch.append(f"バリュエーション（PER {per:.0f}倍）の正当化に足る業績確認が必須")
+    if fcf is not None and fcf < 5:
+        watch.append("フリーキャッシュフロー転換の時期と追加資金調達リスク")
+    watch.append("マクロ環境（金利動向・為替・地政学リスク）の変化と株価への影響")
+    result["着目点"] = watch
+
+    _OUTLOOK_CACHE[ticker] = result
+    return result
+
+
+# ─────────────────────────────────────────
 # チャート生成
 # ─────────────────────────────────────────
 def generate_stock_chart(df: pd.DataFrame, ticker: str, market: str,
@@ -1700,6 +1855,28 @@ def _build_stock_detail(elems, r: dict, s_small, df_raw=None):
                                      fg=colors.HexColor("#b91c1c"), font_size=8.5))
         if forecast.get("弱気"):
             elems.append(_p(forecast["弱気"], s_bear))
+        elems.append(Spacer(1, 2 * mm))
+
+    # Section 3.8: 競合・需要予測・着目点
+    outlook = generate_market_outlook(r)
+    if outlook:
+        s_ol = _style(f"_ol_{ticker}", fontSize=8.5, leading=14, spaceAfter=1, textColor=C_BLACK)
+        s_watch = _style(f"_ow_{ticker}", fontSize=8.5, leading=14, spaceAfter=1,
+                         textColor=colors.HexColor("#0369a1"))
+        elems.append(_section_header("■ 競合環境", bg=colors.HexColor("#fef9c3"),
+                                     fg=colors.HexColor("#854d0e"), font_size=8.5))
+        if outlook.get("競合"):
+            elems.append(_p(outlook["競合"], s_ol))
+        elems.append(Spacer(1, 1 * mm))
+        elems.append(_section_header("■ 需要予測・市場トレンド", bg=colors.HexColor("#e0f2fe"),
+                                     fg=colors.HexColor("#0369a1"), font_size=8.5))
+        if outlook.get("需要"):
+            elems.append(_p(outlook["需要"], s_ol))
+        elems.append(Spacer(1, 1 * mm))
+        elems.append(_section_header("■ 今後着目すべき事項", bg=colors.HexColor("#f3e8ff"),
+                                     fg=colors.HexColor("#7e22ce"), font_size=8.5))
+        for pt in outlook.get("着目点", []):
+            elems.append(_p(f"・{pt}" if not pt.startswith("・") else pt, s_watch))
         elems.append(Spacer(1, 2 * mm))
 
     # Section 4: ファンダメンタルズ（3列 × 3行）
